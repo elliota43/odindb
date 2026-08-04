@@ -44,6 +44,24 @@ close_tree :: proc(p: ^pager.Pager, filename: string) {
 	_ = os.remove(filename)
 }
 
+reopen_tree_int_int :: proc(
+	t: ^testing.T,
+	filename: string,
+) -> (
+	p: ^pager.Pager,
+	tree: Tree(int, int, ORDER),
+) {
+	ok: bool
+	p, ok = pager.pager_open(filename)
+	testing.expect(t, ok, "pager_open failed on reopen")
+	init(&tree, p)
+	return
+}
+
+flush_tree :: proc(p: ^pager.Pager) {
+	pager.pager_close(p)
+}
+
 @(test)
 test_init_empty :: proc(t: ^testing.T) {
 	filename := "test_btree_init_empty.db"
@@ -140,7 +158,11 @@ test_sequential_insertion :: proc(t: ^testing.T) {
 	}
 
 	testing.expect(t, tree.root_page != INVALID_PAGE_ID)
-	testing.expect(t, root_is_internal(&tree), "root should be internal after capacity was exceeded")
+	testing.expect(
+		t,
+		root_is_internal(&tree),
+		"root should be internal after capacity was exceeded",
+	)
 	testing.expect_value(t, len(&tree), 15)
 
 	for i in 1 ..= 15 {
@@ -588,5 +610,145 @@ test_remove_preserves_leaf_chain_order :: proc(t: ^testing.T) {
 			prev_max = keys[builtin.len(keys) - 1]
 		}
 		curr = get_leaf_next_leaf(page)
+	}
+}
+
+@(test)
+test_meta_page_bootstrap_fields :: proc(t: ^testing.T) {
+	filename := "test_btree_meta_boot.db"
+	p, tree := open_tree_int_int(t, filename)
+	defer close_tree(p, filename)
+	defer destroy(&tree)
+
+	meta, ok := pager.get_page(p, META_PAGE_ID)
+	testing.expect(t, ok)
+
+	testing.expect_value(t, get_meta_magic(meta), u32(MAGIC_NUMBER))
+	testing.expect_value(t, get_meta_version(meta), u32(META_VERSION))
+	testing.expect_value(t, get_meta_pagesize(meta), u32(pager.PAGE_SIZE))
+	testing.expect_value(t, get_meta_order(meta), u32(ORDER))
+	testing.expect_value(t, get_meta_len(meta), u64(0))
+	testing.expect_value(t, get_meta_freelist(meta), INVALID_PAGE_ID)
+
+	testing.expect(t, tree.root_page != META_PAGE_ID)
+	testing.expect_value(t, get_meta_root(meta), tree.root_page)
+	testing.expect(t, root_is_leaf(&tree))
+}
+
+@(test)
+test_meta_len_tracks_insert_remove :: proc(t: ^testing.T) {
+	filename := "test_btree_meta_len.db"
+	p, tree := open_tree_int_int(t, filename)
+	defer close_tree(p, filename)
+	defer destroy(&tree)
+
+	insert(&tree, 1, 10)
+	insert(&tree, 2, 20)
+	meta, _ := pager.get_page(p, META_PAGE_ID)
+	testing.expect_value(t, get_meta_len(meta), u64(2))
+	testing.expect_value(t, len(&tree), 2)
+
+	testing.expect(t, remove(&tree, 1))
+	testing.expect_value(t, get_meta_len(meta), u64(1))
+	testing.expect_value(t, len(&tree), 1)
+
+	// update shouldnt change len
+	insert(&tree, 2, 99)
+	testing.expect_value(t, get_meta_len(meta), u64(1))
+}
+
+
+@(test)
+test_reopen_preserves_keys_and_len :: proc(t: ^testing.T) {
+	filename := "test_btree_reopen_keys.db"
+	_ = os.remove(filename)
+	{
+		p, ok := pager.pager_open(filename)
+		testing.expect(t, ok)
+		tree: Tree(int, int, ORDER)
+		init(&tree, p)
+		for i in 1 ..= 10 {
+			insert(&tree, i, i * 10)
+		}
+		testing.expect_value(t, len(&tree), 10)
+		flush_tree(p)
+		destroy(&tree)
+	}
+	{
+		p, tree := reopen_tree_int_int(t, filename)
+		defer close_tree(p, filename)
+		defer destroy(&tree)
+		testing.expect_value(t, len(&tree), 10)
+		for i in 1 ..= 10 {
+			v, ok := get(&tree, i)
+			testing.expectf(t, ok, "missing key %d after reopen", i)
+			testing.expect_value(t, v, i * 10)
+		}
+	}
+}
+@(test)
+test_reopen_preserves_root_after_split :: proc(t: ^testing.T) {
+	filename := "test_btree_reopen_split.db"
+	_ = os.remove(filename)
+	root_after_split: pager.Page_ID
+	{
+		p, ok := pager.pager_open(filename)
+		testing.expect(t, ok)
+		tree: Tree(int, int, ORDER)
+		init(&tree, p)
+		// ORDER=3 → 3rd insert splits leaf root into internal
+		insert(&tree, 1, 1)
+		insert(&tree, 2, 2)
+		insert(&tree, 3, 3)
+		testing.expect(t, root_is_internal(&tree))
+		root_after_split = tree.root_page
+		meta, _ := pager.get_page(p, META_PAGE_ID)
+		testing.expect_value(t, get_meta_root(meta), root_after_split)
+		flush_tree(p)
+		destroy(&tree)
+	}
+	{
+		p, tree := reopen_tree_int_int(t, filename)
+		defer close_tree(p, filename)
+		defer destroy(&tree)
+		testing.expect_value(t, tree.root_page, root_after_split)
+		testing.expect(t, root_is_internal(&tree))
+		testing.expect_value(t, len(&tree), 3)
+		for i in 1 ..= 3 {
+			v, ok := get(&tree, i)
+			testing.expect(t, ok)
+			testing.expect_value(t, v, i)
+		}
+	}
+}
+@(test)
+test_reopen_preserves_root_after_shrink :: proc(t: ^testing.T) {
+	filename := "test_btree_reopen_shrink.db"
+	_ = os.remove(filename)
+	{
+		p, ok := pager.pager_open(filename)
+		testing.expect(t, ok)
+		tree: Tree(int, int, ORDER)
+		init(&tree, p)
+		insert(&tree, 1, 1)
+		insert(&tree, 2, 2)
+		insert(&tree, 3, 3)
+		testing.expect(t, root_is_internal(&tree))
+		testing.expect(t, remove(&tree, 3))
+		testing.expect(t, remove(&tree, 1))
+		testing.expect(t, root_is_leaf(&tree))
+		testing.expect_value(t, len(&tree), 1)
+		flush_tree(p)
+		destroy(&tree)
+	}
+	{
+		p, tree := reopen_tree_int_int(t, filename)
+		defer close_tree(p, filename)
+		defer destroy(&tree)
+		testing.expect(t, root_is_leaf(&tree))
+		testing.expect_value(t, len(&tree), 1)
+		v, ok := get(&tree, 2)
+		testing.expect(t, ok)
+		testing.expect_value(t, v, 2)
 	}
 }
