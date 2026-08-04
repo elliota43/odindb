@@ -46,7 +46,8 @@ init :: proc(
 	t: ^$T/Tree($K, $V, $N),
 	allocator := context.allocator,
 ) where intrinsics.type_is_ordered_numeric(K),
-	N >= 3 {
+	N >=
+	3 {
 	context.allocator = allocator
 	t.allocator = allocator
 	t.len = 0
@@ -99,6 +100,15 @@ insert :: proc(t: ^$T/Tree($K, $V, $N), key: K, value: V) {
 	insert_upward(t, path[:path_len], leaf_node, right_node, promote)
 }
 
+remove :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> (ok: bool) {
+	context.allocator = t.allocator
+
+	path: [MAX_HEIGHT]Path_Entry(K, V, N)
+	path_len := 0
+
+	leaf := find_leaf(t, key, path[:], &path_len)
+}
+
 get :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> (value: V, ok: bool) {
 	if t.root == nil {
 		return {}, false
@@ -148,6 +158,8 @@ print :: proc(t: ^$T/Tree($K, $V, $N)) {
 
 // ==== internal helpers ====
 
+// search_key linearly searches sorted `keys` for `key`. It returns the index where
+// `key` is or should be inserted, and whether an exact match was found.
 search_key :: proc(keys: []$K, key: K) -> (index: int, found: bool) {
 	i := 0
 	for i < builtin.len(keys) && keys[i] < key {
@@ -161,6 +173,8 @@ search_key :: proc(keys: []$K, key: K) -> (index: int, found: bool) {
 	return i, false
 }
 
+// child_index returns the child slot in `node` that should be followed when
+// looking up `key` (the first index i such that `key < key[i]`, or `len(keys)`).
 child_index :: proc(node: ^Internal($K, $V, $N), key: K) -> int {
 	keys := small_array.slice(&node.keys)
 	i := 0
@@ -170,6 +184,8 @@ child_index :: proc(node: ^Internal($K, $V, $N), key: K) -> int {
 	return i
 }
 
+// peek_leaf walks from root to the leaf that would hold key and returns a pointer
+// to that leaf's payload. It does not record the descent path.
 peek_leaf :: proc(root: ^Node($K, $V, $N), key: K) -> ^Leaf(K, V, N) {
 	curr := root
 	for {
@@ -182,6 +198,9 @@ peek_leaf :: proc(root: ^Node($K, $V, $N), key: K) -> ^Leaf(K, V, N) {
 	}
 }
 
+// find_leaf_node walks the tree to the leaf that would hold key and returns
+// the leaf as a ^Node, suitable for structural ops that require a ^Node(K, V, N)
+// object, like splitting and merging.
 find_leaf_node :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> ^Node(K, V, N) {
 	curr := t.root
 	for {
@@ -194,6 +213,8 @@ find_leaf_node :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> ^Node(K, V, N) {
 	}
 }
 
+// find_leaf walks the tree to the leaf that would hold `key`, records each internal parent and child
+// index in `path`, and returns a ^Leaf into that node's payload for key/value access.
 find_leaf :: proc(
 	t: ^$T/Tree($K, $V, $N),
 	key: K,
@@ -217,6 +238,8 @@ find_leaf :: proc(
 	}
 }
 
+// leftmost returns the leftmost leaf under `root` as a `^Node(K, V, N)`, following
+// `children[0]` at each internal node.
 leftmost :: proc(root: ^Node($K, $V, $N)) -> ^Node(K, V, N) {
 	curr := root
 	for {
@@ -229,6 +252,9 @@ leftmost :: proc(root: ^Node($K, $V, $N)) -> ^Node(K, V, N) {
 	}
 }
 
+// split_leaf splits a full leaf `left_node` at `mid = N / 2` into left and a new
+// right sibling, links them via the leaf node's next pointers, and returns the right node
+// plus the separator key to promote (the first key of the right leaf).
 split_leaf :: proc(left_node: ^Node($K, $V, $N)) -> (right_node: ^Node(K, V, N), promote: K) {
 	left := &left_node.(Leaf(K, V, N))
 	mid := N / 2
@@ -253,6 +279,9 @@ split_leaf :: proc(left_node: ^Node($K, $V, $N)) -> (right_node: ^Node(K, V, N),
 	return
 }
 
+// split_internal splits a full internal `left_node` at `mid = N/2`. The middle key is removed
+// and returned as `promote`; keys/children after mid move to the right sibling.
+// The left sibling keeps `keys[0 .. mid]` and `children[0 .. mid]`.
 split_internal :: proc(left_node: ^Node($K, $V, $N)) -> (right_node: ^Node(K, V, N), promote: K) {
 	left := &left_node.(Internal(K, V, N))
 	mid := N / 2
@@ -277,6 +306,10 @@ split_internal :: proc(left_node: ^Node($K, $V, $N)) -> (right_node: ^Node(K, V,
 	return
 }
 
+
+// insert_upward inserts the separator `key` and sibling `right` into the
+// parents recorded in `path`, splitting full internals as needed. If the
+// ascent reaches past the old root, a new root is allocated.
 insert_upward :: proc(
 	t: ^$T/Tree($K, $V, $N),
 	path: []Path_Entry(K, V, N),
@@ -311,6 +344,7 @@ insert_upward :: proc(
 	t.root = new_root
 }
 
+// destroy_node recursively frees `n` and its descendants.
 destroy_node :: proc(n: ^Node($K, $V, $N)) {
 	if n == nil {
 		return
@@ -328,6 +362,7 @@ destroy_node :: proc(n: ^Node($K, $V, $N)) {
 	free(n)
 }
 
+// print_node recursively prints the subtree at `n` as an ASCII tree.
 print_node :: proc(n: ^Node($K, $V, $N), prefix: string, is_last: bool) {
 	branch := is_last ? "└── " : "├── "
 	switch &v in n^ {
