@@ -18,6 +18,113 @@ Node_Type :: enum u8 {
 	Leaf     = 1,
 }
 
+//=== META PAGE HEADER ===
+
+META_PAGE_ID :: pager.Page_ID(0)
+
+META_VERSION :: 1
+
+MAGIC_NUMBER :: 0x4F44494E
+
+META_MAGIC_OFFSET :: 0
+META_MAGIC_SIZE :: 4
+META_VERSION_OFFSET :: META_MAGIC_OFFSET + META_MAGIC_SIZE
+META_VERSION_SIZE :: 4
+META_ROOT_OFFSET :: META_VERSION_OFFSET + META_VERSION_SIZE
+META_ROOT_SIZE :: 4
+META_FREELIST_OFFSET :: META_ROOT_OFFSET + META_ROOT_SIZE
+META_FREELIST_SIZE :: 4
+META_LEN_OFFSET :: META_FREELIST_OFFSET + META_FREELIST_SIZE
+META_LEN_SIZE :: 8 // u64 record count
+META_PAGE_SIZE_OFFSET :: META_LEN_OFFSET + META_LEN_SIZE
+META_PAGE_SIZE_SIZE :: 4
+META_ORDER_OFFSET :: META_PAGE_SIZE_OFFSET + META_PAGE_SIZE_SIZE
+META_ORDER_SIZE :: 4
+
+
+get_meta_magic :: proc(page: ^pager.Page) -> u32 {
+	ptr := (^u32)(&page.data[META_MAGIC_OFFSET])
+	return ptr^
+}
+
+set_meta_magic :: proc(page: ^pager.Page, magic: u32) {
+	ptr := (^u32)(&page.data[META_MAGIC_OFFSET])
+	ptr^ = magic
+}
+
+get_meta_version :: proc(page: ^pager.Page) -> u32 {
+	ptr := (^u32)(&page.data[META_VERSION_OFFSET])
+	return ptr^
+}
+
+set_meta_version :: proc(page: ^pager.Page, version: u32) {
+	ptr := (^u32)(&page.data[META_VERSION_OFFSET])
+	ptr^ = version
+}
+
+get_meta_root :: proc(page: ^pager.Page) -> pager.Page_ID {
+	ptr := (^u32)(&page.data[META_ROOT_OFFSET])
+	return pager.Page_ID(ptr^)
+}
+
+set_meta_root :: proc(page: ^pager.Page, root_id: pager.Page_ID) {
+	ptr := (^u32)(&page.data[META_ROOT_OFFSET])
+	ptr^ = u32(root_id)
+}
+
+get_meta_len :: proc(page: ^pager.Page) -> u64 {
+	ptr := (^u64)(&page.data[META_LEN_OFFSET])
+	return ptr^
+}
+
+set_meta_len :: proc(page: ^pager.Page, len: u64) {
+	ptr := (^u64)(&page.data[META_LEN_OFFSET])
+	ptr^ = len
+}
+
+get_meta_freelist :: proc(page: ^pager.Page) -> pager.Page_ID {
+	ptr := (^u32)(&page.data[META_FREELIST_OFFSET])
+	return pager.Page_ID(ptr^)
+}
+
+set_meta_freelist :: proc(page: ^pager.Page, freelist_id: pager.Page_ID) {
+	ptr := (^u32)(&page.data[META_FREELIST_OFFSET])
+	ptr^ = u32(freelist_id)
+}
+
+get_meta_pagesize :: proc(page: ^pager.Page) -> u32 {
+	ptr := (^u32)(&page.data[META_PAGE_SIZE_OFFSET])
+	return ptr^
+}
+
+set_meta_pagesize :: proc(page: ^pager.Page, size: u32) {
+	ptr := (^u32)(&page.data[META_PAGE_SIZE_OFFSET])
+	ptr^ = size
+}
+
+get_meta_order :: proc(page: ^pager.Page) -> u32 {
+	ptr := (^u32)(&page.data[META_ORDER_OFFSET])
+	return ptr^
+}
+
+set_meta_order :: proc(page: ^pager.Page, order: u32) {
+	ptr := (^u32)(&page.data[META_ORDER_OFFSET])
+	ptr^ = order
+}
+
+set_tree_root :: proc(t: ^Tree($K, $V, $N), root_id: pager.Page_ID) {
+	t.root_page = root_id
+	meta, ok := pager.get_page(t.p, META_PAGE_ID)
+	assert(ok)
+	set_meta_root(meta, root_id)
+}
+
+sync_meta_len :: proc(t: ^Tree($K, $V, $N)) {
+	meta, ok := pager.get_page(t.p, META_PAGE_ID)
+	assert(ok)
+	set_meta_len(meta, u64(t.len))
+}
+
 // === COMMON HEADERS ===
 
 NODE_TYPE_OFFSET :: 0
@@ -264,7 +371,8 @@ init :: proc(
 	p: ^pager.Pager,
 	allocator := context.allocator,
 ) where intrinsics.type_is_ordered_numeric(K),
-	N >= 3 {
+	N >=
+	3 {
 	assert(
 		LEAF_HEADER_SIZE + (N * size_of(K)) + (N * size_of(V)) <= pager.PAGE_SIZE,
 		"Leaf node exceeds page size",
@@ -278,11 +386,39 @@ init :: proc(
 	context.allocator = allocator
 	t.allocator = allocator
 	t.p = p
-	t.len = 0
 
-	// Fresh DB only; reopen via meta page is TODO.
-	assert(p.num_pages == 0, "init expects an empty pager; reopen via meta page not implemented")
-	t.root_page = alloc_leaf_page(t, true)
+	if p.num_pages == 0 {
+		// bootstrap db
+		meta_page, meta_id, mok := pager.alloc_page(t.p)
+		assert(mok && meta_id == META_PAGE_ID, "Meta page must be ID 0")
+		mem.zero_slice(meta_page.data[:])
+
+		set_meta_magic(meta_page, MAGIC_NUMBER)
+		set_meta_version(meta_page, META_VERSION)
+		set_meta_freelist(meta_page, INVALID_PAGE_ID)
+		set_meta_len(meta_page, 0)
+		set_meta_pagesize(meta_page, u32(pager.PAGE_SIZE))
+		set_meta_order(meta_page, u32(N))
+
+		set_tree_root(t, alloc_leaf_page(t, true))
+
+		return
+	}
+
+	// mount existing db
+
+	meta_page, mok := pager.get_page(t.p, META_PAGE_ID)
+	assert(mok, "failed to read meta page")
+
+	assert(get_meta_magic(meta_page) == MAGIC_NUMBER, "bad magic")
+	assert(get_meta_version(meta_page) == META_VERSION, "unsupported version number")
+	assert(get_meta_pagesize(meta_page) == u32(pager.PAGE_SIZE), "page size mismatch")
+	assert(get_meta_order(meta_page) == u32(N), "tree order mismatch")
+
+	t.root_page = get_meta_root(meta_page)
+	t.len = int(get_meta_len(meta_page))
+
+	assert(t.root_page != META_PAGE_ID && t.root_page != INVALID_PAGE_ID, "invalid root page")
 }
 
 // destroy clears the tree struct. Page memory is owned by the pager.
@@ -325,8 +461,11 @@ insert :: proc(t: ^$T/Tree($K, $V, $N), key: K, value: V) {
 	}
 
 	assert(get_leaf_num_cells(leaf) < u32(N), "leaf unexpectedly full")
+
+
 	leaf_insert_cell(leaf, idx, key, value, N)
 	t.len += 1
+	sync_meta_len(t)
 
 	if get_leaf_num_cells(leaf) < u32(N) {
 		return
@@ -351,6 +490,7 @@ remove :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> (ok: bool) {
 
 	leaf_remove_cell(leaf, idx, K, V, N)
 	t.len -= 1
+	sync_meta_len(t)
 
 	if path_len == 0 {
 		return true
@@ -466,7 +606,10 @@ find_leaf :: proc(
 		case .Internal:
 			assert(path_len^ < builtin.len(path), "tree height exceeded MAX_HEIGHT")
 			idx := child_index(page, key)
-			path[path_len^] = Path_Entry{page_id = curr, index = idx}
+			path[path_len^] = Path_Entry {
+				page_id = curr,
+				index   = idx,
+			}
 			path_len^ += 1
 			curr = get_internal_child(page, u32(idx), K, N)
 		}
@@ -658,7 +801,7 @@ insert_upward :: proc(
 	set_parent(left, new_root_id)
 	set_parent(right, new_root_id)
 
-	t.root_page = new_root_id
+	set_tree_root(t, new_root_id)
 }
 
 remove_upward :: proc(t: ^Tree($K, $V, $N), path: []Path_Entry) {
@@ -881,9 +1024,10 @@ shrink_root :: proc(t: ^Tree($K, $V, $N)) {
 	only := get_internal_child(root, 0, K, N)
 	child, cok := pager.get_page(t.p, only)
 	assert(cok)
+
 	set_is_root(child, true)
 	set_parent(child, INVALID_PAGE_ID)
-	t.root_page = only
+	set_tree_root(t, only)
 	// TODO: return old root to a free list
 }
 
