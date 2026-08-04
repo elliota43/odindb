@@ -46,8 +46,7 @@ init :: proc(
 	t: ^$T/Tree($K, $V, $N),
 	allocator := context.allocator,
 ) where intrinsics.type_is_ordered_numeric(K),
-	N >=
-	3 {
+	N >= 3 {
 	context.allocator = allocator
 	t.allocator = allocator
 	t.len = 0
@@ -134,7 +133,7 @@ remove :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> (ok: bool) {
 	}
 
 	// underflowed
-	remove_upward(t, &path[:path_len])
+	remove_upward(t, path[:path_len])
 	return true
 }
 
@@ -203,17 +202,8 @@ search_key :: proc(keys: []$K, key: K) -> (index: int, found: bool) {
 }
 
 // child_index returns the child slot in `node` that should be followed when
-// looking up `key` (the first index i such that `key < key[i]`, or `len(keys)`).
-child_index :: proc(
-	node: ^Internal($K, $V, $N),
-	key: K,
-) -> // peek_leaf walks from root to the leaf that would hold key and returns a pointer
-	// to that leaf's payload. It does not record the descent path.
-
-
-	// find_leaf_node walks the tree to the leaf that would hold key and returns
-	// the leaf as a ^Node, suitable for structural ops that require a ^Node(K, V, N)
-	int {// object, like splitting and merging.
+// looking up `key` (the first index i such that `key < keys[i]`, or `len(keys)`).
+child_index :: proc(node: ^Internal($K, $V, $N), key: K) -> int {
 	keys := small_array.slice(&node.keys)
 	i := 0
 	for i < builtin.len(keys) && key >= keys[i] {
@@ -222,7 +212,8 @@ child_index :: proc(
 	return i
 }
 
-
+// peek_leaf walks from root to the leaf that would hold `key` and returns a pointer
+// to that leaf's payload. It does not record the descent path.
 peek_leaf :: proc(root: ^Node($K, $V, $N), key: K) -> ^Leaf(K, V, N) {
 	curr := root
 	for {
@@ -235,7 +226,9 @@ peek_leaf :: proc(root: ^Node($K, $V, $N), key: K) -> ^Leaf(K, V, N) {
 	}
 }
 
-
+// find_leaf_node walks the tree to the leaf that would hold `key` and returns
+// the leaf as a ^Node, suitable for structural ops that require a ^Node(K, V, N)
+// object, like splitting and merging.
 find_leaf_node :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> ^Node(K, V, N) {
 	curr := t.root
 	for {
@@ -316,7 +309,7 @@ split_leaf :: proc(left_node: ^Node($K, $V, $N)) -> (right_node: ^Node(K, V, N),
 
 // split_internal splits a full internal `left_node` at `mid = N/2`. The middle key is removed
 // and returned as `promote`; keys/children after mid move to the right sibling.
-// The left sibling keeps `keys[0 .. mid]` and `children[0 .. mid]`.
+// The left sibling keeps `keys[0 .. mid)` and `children[0 ..= mid]`.
 split_internal :: proc(left_node: ^Node($K, $V, $N)) -> (right_node: ^Node(K, V, N), promote: K) {
 	left := &left_node.(Internal(K, V, N))
 	mid := N / 2
@@ -379,7 +372,10 @@ insert_upward :: proc(
 	t.root = new_root
 }
 
-remove_upward :: proc(t: ^$T/Tree($K, $V, $N), path: []Path_Entry(K, V, N), node: ^Node(K, V, N)) {
+// remove_upward repairs underflow along `path` from the leaf's parent toward the root.
+// At each level: borrow from a sibling if possible; otherwise merge. If the ascent
+// empties the root of keys, shrink_root collapses it to its sole child.
+remove_upward :: proc(t: ^$T/Tree($K, $V, $N), path: []Path_Entry(K, V, N)) {
 	min_keys := N / 2
 
 	for i := builtin.len(path) - 1; i >= 0; i -= 1 {
@@ -492,8 +488,9 @@ try_borrow_internal :: proc(parent: ^Internal($K, $V, $N), idx: int) -> bool {
 	return false
 }
 
+// shrink_root replaces an internal root that has no keys (one child) with that child.
 shrink_root :: proc(t: ^$T/Tree($K, $V, $N)) {
-	switch &n in t.root^ {
+	#partial switch &n in t.root^ {
 	case Internal(K, V, N):
 		if small_array.len(n.keys) == 0 {
 			assert(small_array.len(n.children) == 1)
