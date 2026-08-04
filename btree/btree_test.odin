@@ -1,31 +1,58 @@
 package btree
 
+import "../pager"
 import "base:builtin"
-import "core:container/small_array"
 import "core:fmt"
+import "core:os"
 import "core:slice"
 import "core:testing"
 
 ORDER :: 3
 
-is_internal :: proc(n: ^Node($K, $V, $N)) -> bool {
-	_, ok := n^.(Internal(K, V, N))
-	return ok
+open_tree_int_string :: proc(
+	t: ^testing.T,
+	filename: string,
+) -> (
+	p: ^pager.Pager,
+	tree: Tree(int, string, ORDER),
+) {
+	_ = os.remove(filename)
+	ok: bool
+	p, ok = pager.pager_open(filename)
+	testing.expect(t, ok, "pager_open failed")
+	init(&tree, p)
+	return
 }
 
-is_leaf :: proc(n: ^Node($K, $V, $N)) -> bool {
-	_, ok := n^.(Leaf(K, V, N))
-	return ok
+open_tree_int_int :: proc(
+	t: ^testing.T,
+	filename: string,
+) -> (
+	p: ^pager.Pager,
+	tree: Tree(int, int, ORDER),
+) {
+	_ = os.remove(filename)
+	ok: bool
+	p, ok = pager.pager_open(filename)
+	testing.expect(t, ok, "pager_open failed")
+	init(&tree, p)
+	return
+}
+
+close_tree :: proc(p: ^pager.Pager, filename: string) {
+	pager.pager_close(p)
+	_ = os.remove(filename)
 }
 
 @(test)
 test_init_empty :: proc(t: ^testing.T) {
-	tree: Tree(int, string, ORDER)
-	init(&tree)
+	filename := "test_btree_init_empty.db"
+	p, tree := open_tree_int_string(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
-	testing.expect(t, tree.root != nil, "root should be allocated")
-	testing.expect(t, is_leaf(tree.root), "fresh tree root should be a leaf")
+	testing.expect(t, tree.root_page != INVALID_PAGE_ID, "root should be allocated")
+	testing.expect(t, root_is_leaf(&tree), "fresh tree root should be a leaf")
 	testing.expect_value(t, len(&tree), 0)
 
 	_, ok := get(&tree, 1)
@@ -33,21 +60,23 @@ test_init_empty :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_destroy_nil_root :: proc(t: ^testing.T) {
+test_destroy_clears_tree :: proc(t: ^testing.T) {
 	tree: Tree(int, string, ORDER)
-	destroy(&tree) // should be a no-op
-	testing.expect(t, tree.root == nil)
+	destroy(&tree) // no-op on zero value
+	testing.expect(t, tree.p == nil)
+	testing.expect_value(t, tree.root_page, pager.Page_ID(0))
 }
 
 @(test)
 test_single_insert_and_get :: proc(t: ^testing.T) {
-	tree: Tree(int, string, ORDER)
-	init(&tree)
+	filename := "test_btree_single.db"
+	p, tree := open_tree_int_string(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	insert(&tree, 42, "answer")
 	testing.expect_value(t, len(&tree), 1)
-	testing.expect(t, is_leaf(tree.root), "single insert should keep a leaf root")
+	testing.expect(t, root_is_leaf(&tree), "single insert should keep a leaf root")
 
 	v, ok := get(&tree, 42)
 	testing.expect(t, ok)
@@ -59,8 +88,9 @@ test_single_insert_and_get :: proc(t: ^testing.T) {
 
 @(test)
 test_update_existing_key :: proc(t: ^testing.T) {
-	tree: Tree(int, string, ORDER)
-	init(&tree)
+	filename := "test_btree_update.db"
+	p, tree := open_tree_int_string(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	insert(&tree, 1, "one")
@@ -74,17 +104,17 @@ test_update_existing_key :: proc(t: ^testing.T) {
 
 @(test)
 test_insert_until_leaf_splits :: proc(t: ^testing.T) {
-	tree: Tree(int, string, ORDER)
-	init(&tree)
+	filename := "test_btree_split.db"
+	p, tree := open_tree_int_string(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
-	// ORDER keys fit in one leaf; the ORDER-th insert triggers a split.
 	insert(&tree, 1, "a")
 	insert(&tree, 2, "b")
-	testing.expect(t, is_leaf(tree.root), "root should still be a leaf before capacity is hit")
+	testing.expect(t, root_is_leaf(&tree), "root should still be a leaf before capacity is hit")
 
 	insert(&tree, 3, "c")
-	testing.expect(t, is_internal(tree.root), "root should split into an internal node")
+	testing.expect(t, root_is_internal(&tree), "root should split into an internal node")
 	testing.expect_value(t, len(&tree), 3)
 
 	v1, ok1 := get(&tree, 1)
@@ -100,20 +130,17 @@ test_insert_until_leaf_splits :: proc(t: ^testing.T) {
 
 @(test)
 test_sequential_insertion :: proc(t: ^testing.T) {
-	tree: Tree(int, string, ORDER)
-	init(&tree)
+	filename := "test_btree_seq.db"
+	p, tree := open_tree_int_string(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	for i in 1 ..= 15 {
 		insert(&tree, i, fmt.tprintf("val-%d", i))
 	}
 
-	testing.expect(t, tree.root != nil, "tree root is nil after insertion")
-	testing.expect(
-		t,
-		is_internal(tree.root),
-		"root should be internal after capacity was exceeded",
-	)
+	testing.expect(t, tree.root_page != INVALID_PAGE_ID)
+	testing.expect(t, root_is_internal(&tree), "root should be internal after capacity was exceeded")
 	testing.expect_value(t, len(&tree), 15)
 
 	for i in 1 ..= 15 {
@@ -125,8 +152,9 @@ test_sequential_insertion :: proc(t: ^testing.T) {
 
 @(test)
 test_reverse_insertion :: proc(t: ^testing.T) {
-	tree: Tree(int, int, ORDER)
-	init(&tree)
+	filename := "test_btree_rev.db"
+	p, tree := open_tree_int_int(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	for i := 20; i >= 1; i -= 1 {
@@ -143,8 +171,9 @@ test_reverse_insertion :: proc(t: ^testing.T) {
 
 @(test)
 test_shuffled_insertion :: proc(t: ^testing.T) {
-	tree: Tree(int, int, ORDER)
-	init(&tree)
+	filename := "test_btree_shuf.db"
+	p, tree := open_tree_int_int(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	keys := []int{5, 1, 9, 3, 7, 2, 8, 4, 6, 0, 10}
@@ -162,8 +191,9 @@ test_shuffled_insertion :: proc(t: ^testing.T) {
 
 @(test)
 test_iterate_leaf_in_order :: proc(t: ^testing.T) {
-	tree: Tree(int, string, ORDER)
-	init(&tree)
+	filename := "test_btree_iter.db"
+	p, tree := open_tree_int_string(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	input := []int{4, 1, 3, 2, 8, 5, 7, 6}
@@ -197,8 +227,9 @@ test_iterate_leaf_in_order :: proc(t: ^testing.T) {
 
 @(test)
 test_iterate_leaf_early_stop :: proc(t: ^testing.T) {
-	tree: Tree(int, int, ORDER)
-	init(&tree)
+	filename := "test_btree_iter_stop.db"
+	p, tree := open_tree_int_int(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	for i in 1 ..= 10 {
@@ -220,8 +251,9 @@ test_iterate_leaf_early_stop :: proc(t: ^testing.T) {
 
 @(test)
 test_update_after_splits :: proc(t: ^testing.T) {
-	tree: Tree(int, string, ORDER)
-	init(&tree)
+	filename := "test_btree_update_split.db"
+	p, tree := open_tree_int_string(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	for i in 1 ..= 12 {
@@ -241,8 +273,9 @@ test_update_after_splits :: proc(t: ^testing.T) {
 
 @(test)
 test_leaf_sibling_chain_covers_all_keys :: proc(t: ^testing.T) {
-	tree: Tree(int, int, ORDER)
-	init(&tree)
+	filename := "test_btree_chain.db"
+	p, tree := open_tree_int_int(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	for i in 1 ..= 25 {
@@ -250,16 +283,14 @@ test_leaf_sibling_chain_covers_all_keys :: proc(t: ^testing.T) {
 	}
 
 	seen := 0
-	curr := leftmost(tree.root)
-	for curr != nil {
-		leaf := &curr.(Leaf(int, int, ORDER))
-		seen += small_array.len(leaf.keys)
-
-		// keys within a leaf are sorted
-		keys := small_array.slice(&leaf.keys)
+	curr := leftmost(&tree)
+	for curr != INVALID_PAGE_ID {
+		page, ok := pager.get_page(tree.p, curr)
+		testing.expect(t, ok)
+		keys := get_leaf_keys_slice(page, int)
+		seen += builtin.len(keys)
 		testing.expect(t, slice.is_sorted(keys), "leaf keys should be sorted")
-
-		curr = leaf.next
+		curr = get_leaf_next_leaf(page)
 	}
 
 	testing.expect_value(t, seen, 25)
@@ -283,16 +314,16 @@ expect_keys :: proc(t: ^testing.T, tree: ^Tree($K, $V, $N), want: []K) {
 		if i < builtin.len(got) {
 			testing.expect_value(t, got[i], want[i])
 		}
-		v, ok := get(tree, want[i])
+		_, ok := get(tree, want[i])
 		testing.expectf(t, ok, "missing key %v after mutation", want[i])
-		_ = v
 	}
 }
 
 @(test)
 test_remove_missing_key :: proc(t: ^testing.T) {
-	tree: Tree(int, string, ORDER)
-	init(&tree)
+	filename := "test_btree_rm_miss.db"
+	p, tree := open_tree_int_string(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	insert(&tree, 1, "a")
@@ -306,88 +337,84 @@ test_remove_missing_key :: proc(t: ^testing.T) {
 
 @(test)
 test_remove_from_leaf_root :: proc(t: ^testing.T) {
-	tree: Tree(int, string, ORDER)
-	init(&tree)
+	filename := "test_btree_rm_leaf.db"
+	p, tree := open_tree_int_string(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	insert(&tree, 1, "a")
 	insert(&tree, 2, "b")
-	testing.expect(t, is_leaf(tree.root))
+	testing.expect(t, root_is_leaf(&tree))
 
 	ok := remove(&tree, 1)
 	testing.expect(t, ok)
 	testing.expect_value(t, len(&tree), 1)
-	testing.expect(t, is_leaf(tree.root), "root should remain a leaf")
+	testing.expect(t, root_is_leaf(&tree), "root should remain a leaf")
 	expect_keys(t, &tree, []int{2})
 
 	ok = remove(&tree, 2)
 	testing.expect(t, ok)
 	testing.expect_value(t, len(&tree), 0)
-	testing.expect(t, is_leaf(tree.root), "empty tree keeps a leaf root")
+	testing.expect(t, root_is_leaf(&tree), "empty tree keeps a leaf root")
 	_, found := get(&tree, 2)
 	testing.expect(t, !found)
 }
 
 @(test)
 test_remove_without_underflow :: proc(t: ^testing.T) {
-	tree: Tree(int, string, ORDER)
-	init(&tree)
+	filename := "test_btree_rm_nounder.db"
+	p, tree := open_tree_int_string(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
-	// 1,2,3 splits into leaves [1] | [2,3]; removing 3 leaves right with 1 key (min).
 	insert(&tree, 1, "a")
 	insert(&tree, 2, "b")
 	insert(&tree, 3, "c")
-	testing.expect(t, is_internal(tree.root))
+	testing.expect(t, root_is_internal(&tree))
 
 	ok := remove(&tree, 3)
 	testing.expect(t, ok)
-	testing.expect(t, is_internal(tree.root), "no merge/borrow needed; height unchanged")
+	testing.expect(t, root_is_internal(&tree), "no merge/borrow needed; height unchanged")
 	expect_keys(t, &tree, []int{1, 2})
 }
 
 @(test)
 test_remove_leaf_borrow_from_right :: proc(t: ^testing.T) {
-	tree: Tree(int, int, ORDER)
-	init(&tree)
+	filename := "test_btree_rm_borrow_r.db"
+	p, tree := open_tree_int_int(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
-	// After split: left [1], right [2,3]. Removing 1 underflows left; right can donate 2.
 	insert(&tree, 1, 1)
 	insert(&tree, 2, 2)
 	insert(&tree, 3, 3)
 
 	ok := remove(&tree, 1)
 	testing.expect(t, ok)
-	testing.expect(t, is_internal(tree.root), "borrow should not shrink height")
+	testing.expect(t, root_is_internal(&tree), "borrow should not shrink height")
 	expect_keys(t, &tree, []int{2, 3})
 }
 
 @(test)
 test_remove_leaf_borrow_from_left :: proc(t: ^testing.T) {
-	tree: Tree(int, int, ORDER)
-	init(&tree)
+	filename := "test_btree_rm_borrow_l.db"
+	p, tree := open_tree_int_int(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
-	// Build [1,2] | [3] by inserting then deleting from the right until right is minimal,
-	// then give left spare keys and underflow the right leaf.
 	insert(&tree, 1, 1)
 	insert(&tree, 2, 2)
 	insert(&tree, 3, 3)
 	insert(&tree, 4, 4)
-	// Typical shape after 4 inserts with ORDER=3 still has spare on some sibling.
-	// Delete from a right-side leaf that can borrow leftward.
+
 	ok := remove(&tree, 4)
 	testing.expect(t, ok)
 	expect_keys(t, &tree, []int{1, 2, 3})
 
-	// Force rightmost underflow after left has > min keys.
-	// Re-insert to create left-heavy siblings, then remove from the right leaf.
 	insert(&tree, 4, 4)
 	insert(&tree, 5, 5)
 	ok = remove(&tree, 5)
 	testing.expect(t, ok)
-	// Removing a key that underflows a right leaf should leave all remaining keys findable.
 	for k in ([]int{1, 2, 3, 4}) {
 		_, found := get(&tree, k)
 		testing.expectf(t, found, "missing key %d", k)
@@ -397,27 +424,27 @@ test_remove_leaf_borrow_from_left :: proc(t: ^testing.T) {
 
 @(test)
 test_remove_leaf_merge_and_shrink_root :: proc(t: ^testing.T) {
-	tree: Tree(int, string, ORDER)
-	init(&tree)
+	filename := "test_btree_rm_merge.db"
+	p, tree := open_tree_int_string(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	insert(&tree, 1, "a")
 	insert(&tree, 2, "b")
 	insert(&tree, 3, "c")
-	testing.expect(t, is_internal(tree.root))
+	testing.expect(t, root_is_internal(&tree))
 
-	// left [1], right [2,3] → remove 3 → right [2]; both sides at min (1).
 	testing.expect(t, remove(&tree, 3))
-	// remove 1 → left empty, right at min → merge → root has one child → shrink to leaf.
 	testing.expect(t, remove(&tree, 1))
-	testing.expect(t, is_leaf(tree.root), "merged sole child should become the new root")
+	testing.expect(t, root_is_leaf(&tree), "merged sole child should become the new root")
 	expect_keys(t, &tree, []int{2})
 }
 
 @(test)
 test_remove_all_sequential :: proc(t: ^testing.T) {
-	tree: Tree(int, int, ORDER)
-	init(&tree)
+	filename := "test_btree_rm_all_seq.db"
+	p, tree := open_tree_int_int(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	n :: 20
@@ -440,13 +467,14 @@ test_remove_all_sequential :: proc(t: ^testing.T) {
 	}
 
 	testing.expect_value(t, len(&tree), 0)
-	testing.expect(t, is_leaf(tree.root), "empty tree should finish as a leaf root")
+	testing.expect(t, root_is_leaf(&tree), "empty tree should finish as a leaf root")
 }
 
 @(test)
 test_remove_all_reverse :: proc(t: ^testing.T) {
-	tree: Tree(int, int, ORDER)
-	init(&tree)
+	filename := "test_btree_rm_all_rev.db"
+	p, tree := open_tree_int_int(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	n :: 20
@@ -467,8 +495,9 @@ test_remove_all_reverse :: proc(t: ^testing.T) {
 
 @(test)
 test_remove_shuffled :: proc(t: ^testing.T) {
-	tree: Tree(int, int, ORDER)
-	init(&tree)
+	filename := "test_btree_rm_shuf.db"
+	p, tree := open_tree_int_int(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	keys := []int{5, 1, 9, 3, 7, 2, 8, 4, 6, 0, 10}
@@ -502,8 +531,9 @@ test_remove_shuffled :: proc(t: ^testing.T) {
 
 @(test)
 test_remove_then_reinsert :: proc(t: ^testing.T) {
-	tree: Tree(int, string, ORDER)
-	init(&tree)
+	filename := "test_btree_rm_reins.db"
+	p, tree := open_tree_int_string(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	for i in 1 ..= 12 {
@@ -528,8 +558,9 @@ test_remove_then_reinsert :: proc(t: ^testing.T) {
 
 @(test)
 test_remove_preserves_leaf_chain_order :: proc(t: ^testing.T) {
-	tree: Tree(int, int, ORDER)
-	init(&tree)
+	filename := "test_btree_rm_chain.db"
+	p, tree := open_tree_int_int(t, filename)
+	defer close_tree(p, filename)
 	defer destroy(&tree)
 
 	for i in 1 ..= 25 {
@@ -545,16 +576,17 @@ test_remove_preserves_leaf_chain_order :: proc(t: ^testing.T) {
 	}
 	expect_keys(t, &tree, want[:])
 
-	curr := leftmost(tree.root)
+	curr := leftmost(&tree)
 	prev_max := min(int)
-	for curr != nil {
-		leaf := &curr.(Leaf(int, int, ORDER))
-		keys := small_array.slice(&leaf.keys)
+	for curr != INVALID_PAGE_ID {
+		page, ok := pager.get_page(tree.p, curr)
+		testing.expect(t, ok)
+		keys := get_leaf_keys_slice(page, int)
 		testing.expect(t, slice.is_sorted(keys))
 		if builtin.len(keys) > 0 {
 			testing.expect(t, keys[0] > prev_max, "leaf chain should be globally increasing")
 			prev_max = keys[builtin.len(keys) - 1]
 		}
-		curr = leaf.next
+		curr = get_leaf_next_leaf(page)
 	}
 }

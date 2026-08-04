@@ -3,15 +3,14 @@ package btree
 import "../pager"
 import "base:builtin"
 import "base:intrinsics"
-import "core:container/small_array"
 import "core:fmt"
 import "core:mem"
 
 /*
-   B+Tree
+   B+Tree (page / pager backed)
 
-   ORDER is the maximum number of keys a node may hold.
-   Inserting the ORDERith key causes a split.
+   ORDER (N) is the maximum number of keys a node may hold.
+   Inserting the Nth key causes a split.
 */
 
 Node_Type :: enum u8 {
@@ -22,9 +21,9 @@ Node_Type :: enum u8 {
 // === COMMON HEADERS ===
 
 NODE_TYPE_OFFSET :: 0
-NODE_TYPE_SIZE :: 1 // Node_Type (u8)
+NODE_TYPE_SIZE :: 1
 IS_ROOT_OFFSET :: 1
-IS_ROOT_SIZE :: 1 // bool
+IS_ROOT_SIZE :: 1
 PARENT_POINTER_OFFSET :: 2
 PARENT_POINTER_SIZE :: 4
 COMMON_HEADER_SIZE :: NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE
@@ -39,14 +38,27 @@ LEAF_HEADER_SIZE :: COMMON_HEADER_SIZE + LEAF_NUM_CELLS_SIZE + LEAF_NEXT_LEAF_SI
 //=== INTERNAL NODE HEADER ===
 INTERNAL_NUM_KEYS_OFFSET :: COMMON_HEADER_SIZE
 INTERNAL_NUM_KEYS_SIZE :: 4
-
 INTERNAL_HEADER_SIZE :: COMMON_HEADER_SIZE + INTERNAL_NUM_KEYS_SIZE
-
-//=== COMMON HELPERS ===
 
 // INVALID_PAGE_ID represents a "nil" page id pointer.
 INVALID_PAGE_ID :: pager.Page_ID(0xFFFF_FFFF)
 
+Tree :: struct($K: typeid, $V: typeid, $N: int) where intrinsics.type_is_ordered_numeric(K),
+	N >= 3 {
+	p:         ^pager.Pager,
+	root_page: pager.Page_ID,
+	allocator: mem.Allocator,
+	len:       int,
+}
+
+Path_Entry :: struct {
+	page_id: pager.Page_ID,
+	index:   int,
+}
+
+MAX_HEIGHT :: 64
+
+//=== COMMON HELPERS ===
 
 get_node_type :: proc(page: ^pager.Page) -> Node_Type {
 	return Node_Type(page.data[NODE_TYPE_OFFSET])
@@ -74,7 +86,7 @@ set_is_root :: proc(page: ^pager.Page, is_root: bool) {
 	page.data[IS_ROOT_OFFSET] = u8(is_root)
 }
 
-//=== LEAF HELPERS ===
+//=== LEAF HEADER ===
 
 get_leaf_num_cells :: proc(page: ^pager.Page) -> u32 {
 	ptr := (^u32)(&page.data[LEAF_NUM_CELLS_OFFSET])
@@ -96,26 +108,22 @@ set_leaf_next_leaf :: proc(page: ^pager.Page, next_leaf: pager.Page_ID) {
 	ptr^ = u32(next_leaf)
 }
 
-Tree :: struct($K: typeid, $V: typeid, $N: int) where intrinsics.type_is_ordered_numeric(K),
-	N >= 3 {
-	p:         ^pager.Pager,
-	root_page: pager.Page_ID,
-	allocator: mem.Allocator,
-	len:       int,
+//=== INTERNAL HEADER ===
+
+get_internal_num_keys :: proc(page: ^pager.Page) -> u32 {
+	ptr := (^u32)(&page.data[INTERNAL_NUM_KEYS_OFFSET])
+	return ptr^
 }
 
-Path_Entry :: struct {
-	page_id: pager.Page_ID,
-	index:   int,
+set_internal_num_keys :: proc(page: ^pager.Page, num: u32) {
+	ptr := (^u32)(&page.data[INTERNAL_NUM_KEYS_OFFSET])
+	ptr^ = num
 }
 
-MAX_HEIGHT :: 64
-
-//=== LEAF NODE ARRAYS ===
+//=== LEAF BODY ===
 // Layout: [Header] [Keys...] [Values...]
 
 get_leaf_key :: proc(page: ^pager.Page, index: u32, $K: typeid) -> K {
-	// Offset = Header Size + (index * Size of Key)
 	offset := LEAF_HEADER_SIZE + (index * u32(size_of(K)))
 	ptr := (^K)(&page.data[offset])
 	return ptr^
@@ -128,7 +136,6 @@ set_leaf_key :: proc(page: ^pager.Page, index: u32, key: $K) {
 }
 
 get_leaf_value :: proc(page: ^pager.Page, index: u32, $K: typeid, $V: typeid, $N: int) -> V {
-	// Offset = Header + (Max Keys * Size of Key) + (index * Size of Value)
 	keys_size := u32(N * size_of(K))
 	offset := LEAF_HEADER_SIZE + keys_size + (index * u32(size_of(V)))
 	ptr := (^V)(&page.data[offset])
@@ -142,8 +149,24 @@ set_leaf_value :: proc(page: ^pager.Page, index: u32, value: $V, $K: typeid, $N:
 	ptr^ = value
 }
 
-//=== INTERNAL NODE ARRAYS ===
-// Layout: [Header] [Keys Array] [Children Page_IDs Array]
+get_leaf_keys_slice :: proc(page: ^pager.Page, $K: typeid) -> []K {
+	num_cells := get_leaf_num_cells(page)
+	ptr := (^K)(&page.data[LEAF_HEADER_SIZE])
+	return (cast([^]K)ptr)[:num_cells]
+}
+
+get_leaf_keys_cap :: proc(page: ^pager.Page, $K: typeid, $N: int) -> []K {
+	ptr := (^K)(&page.data[LEAF_HEADER_SIZE])
+	return (cast([^]K)ptr)[:N]
+}
+
+get_leaf_values_cap :: proc(page: ^pager.Page, $K: typeid, $V: typeid, $N: int) -> []V {
+	ptr := (^V)(&page.data[LEAF_HEADER_SIZE + N * size_of(K)])
+	return (cast([^]V)ptr)[:N]
+}
+
+//=== INTERNAL BODY ===
+// Layout: [Header] [Keys...] [Children Page_IDs...]
 
 get_internal_key :: proc(page: ^pager.Page, index: u32, $K: typeid) -> K {
 	offset := INTERNAL_HEADER_SIZE + (index * u32(size_of(K)))
@@ -158,7 +181,6 @@ set_internal_key :: proc(page: ^pager.Page, index: u32, key: $K) {
 }
 
 get_internal_child :: proc(page: ^pager.Page, index: u32, $K: typeid, $N: int) -> pager.Page_ID {
-	// children array comes after the keys array
 	keys_size := u32(N * size_of(K))
 	offset := INTERNAL_HEADER_SIZE + keys_size + (index * u32(size_of(pager.Page_ID)))
 	ptr := (^pager.Page_ID)(&page.data[offset])
@@ -178,39 +200,30 @@ set_internal_child :: proc(
 	ptr^ = child_id
 }
 
-// get_leaf_keys_slice returns a slice of the keys from the leaf's page.
-get_leaf_keys_slice :: proc(page: ^pager.Page, $K: typeid) -> []K {
-	num_cells := get_leaf_num_cells(page)
-	ptr := (^K)(&page.data[LEAF_HEADER_SIZE])
-	// cast ptr to unbounded ptr then slice
-	return (cast([^]K)ptr)[:num_cells]
-}
-
 get_internal_keys_slice :: proc(page: ^pager.Page, $K: typeid) -> []K {
 	num_keys := get_internal_num_keys(page)
 	ptr := (^K)(&page.data[INTERNAL_HEADER_SIZE])
 	return (cast([^]K)ptr)[:num_keys]
 }
 
-get_internal_num_keys :: proc(page: ^pager.Page) -> u32 {
-	ptr := (^u32)(&page.data[INTERNAL_NUM_KEYS_OFFSET])
-	return ptr^
+get_internal_keys_cap :: proc(page: ^pager.Page, $K: typeid, $N: int) -> []K {
+	ptr := (^K)(&page.data[INTERNAL_HEADER_SIZE])
+	return (cast([^]K)ptr)[:N]
 }
 
-set_internal_num_keys :: proc(page: ^pager.Page, num: u32) {
-	ptr := (^u32)(&page.data[INTERNAL_NUM_KEYS_OFFSET])
-	ptr^ = num
+get_internal_children_cap :: proc(page: ^pager.Page, $K: typeid, $N: int) -> []pager.Page_ID {
+	ptr := (^pager.Page_ID)(&page.data[INTERNAL_HEADER_SIZE + N * size_of(K)])
+	return (cast([^]pager.Page_ID)ptr)[:N + 1]
 }
 
+//=== PAGE ALLOCATION ===
 
-// alloc_leaf_page gets a new page from the pager and formats it as a leaf.
-// When `is_root` is true, parent is forced to INVALID_PAGE_ID.
 alloc_leaf_page :: proc(
 	t: ^Tree($K, $V, $N),
 	is_root: bool,
 	parent := INVALID_PAGE_ID,
 ) -> pager.Page_ID {
-	// TODO: implement free list for deleted pages and look there first
+	// TODO: free-list for deleted pages
 	page, new_id, ok := pager.alloc_page(t.p)
 	assert(ok, "failed to allocate new page from pager")
 
@@ -218,7 +231,7 @@ alloc_leaf_page :: proc(
 
 	set_node_type(page, .Leaf)
 	set_is_root(page, is_root)
-	set_parent(page, INVALID_PAGE_ID)
+	set_parent(page, INVALID_PAGE_ID if is_root else parent)
 	set_leaf_next_leaf(page, INVALID_PAGE_ID)
 	set_leaf_num_cells(page, 0)
 
@@ -230,6 +243,7 @@ alloc_internal_page :: proc(
 	is_root: bool,
 	parent := INVALID_PAGE_ID,
 ) -> pager.Page_ID {
+	// TODO: free-list for deleted pages
 	page, new_id, ok := pager.alloc_page(t.p)
 	assert(ok, "failed to allocate new page from pager")
 
@@ -243,38 +257,36 @@ alloc_internal_page :: proc(
 	return new_id
 }
 
+//=== PUBLIC API ===
+
 init :: proc(
 	t: ^$T/Tree($K, $V, $N),
 	p: ^pager.Pager,
 	allocator := context.allocator,
 ) where intrinsics.type_is_ordered_numeric(K),
-	N >=
-	3 {
-
+	N >= 3 {
 	assert(
 		LEAF_HEADER_SIZE + (N * size_of(K)) + (N * size_of(V)) <= pager.PAGE_SIZE,
-		"Leaf node exceeds 4KB page size.",
+		"Leaf node exceeds page size",
 	)
-
 	assert(
 		INTERNAL_HEADER_SIZE + (N * size_of(K)) + ((N + 1) * size_of(pager.Page_ID)) <=
 		pager.PAGE_SIZE,
-		"Internal node exceeds 4KB page size.",
+		"Internal node exceeds page size",
 	)
 
 	context.allocator = allocator
 	t.allocator = allocator
 	t.p = p
 	t.len = 0
+
+	// Fresh DB only; reopen via meta page is TODO.
+	assert(p.num_pages == 0, "init expects an empty pager; reopen via meta page not implemented")
+	t.root_page = alloc_leaf_page(t, true)
 }
 
+// destroy clears the tree struct. Page memory is owned by the pager.
 destroy :: proc(t: ^$T/Tree($K, $V, $N)) {
-	if t.root == nil {
-		return
-	}
-
-	context.allocator = t.allocator
-	destroy_node(t.root)
 	t^ = {}
 }
 
@@ -282,141 +294,136 @@ len :: proc "contextless" (t: ^$T/Tree($K, $V, $N)) -> int {
 	return t.len
 }
 
+root_is_leaf :: proc(t: ^Tree($K, $V, $N)) -> bool {
+	if t.p == nil || t.root_page == INVALID_PAGE_ID {
+		return false
+	}
+	page, ok := pager.get_page(t.p, t.root_page)
+	return ok && get_node_type(page) == .Leaf
+}
+
+root_is_internal :: proc(t: ^Tree($K, $V, $N)) -> bool {
+	if t.p == nil || t.root_page == INVALID_PAGE_ID {
+		return false
+	}
+	page, ok := pager.get_page(t.p, t.root_page)
+	return ok && get_node_type(page) == .Internal
+}
+
 insert :: proc(t: ^$T/Tree($K, $V, $N), key: K, value: V) {
 	context.allocator = t.allocator
 
-	path: [MAX_HEIGHT]Path_Entry(K, V, N)
+	path: [MAX_HEIGHT]Path_Entry
 	path_len := 0
 
 	leaf := find_leaf(t, key, path[:], &path_len)
-
-	keys := small_array.slice(&leaf.keys)
+	keys := get_leaf_keys_slice(leaf, K)
 	idx, found := search_key(keys, key)
 	if found {
-		small_array.set(&leaf.values, idx, value)
+		set_leaf_value(leaf, u32(idx), value, K, N)
 		return
 	}
 
-	assert(small_array.space(leaf.keys) > 0, "leaf unexpectedly full")
-	small_array.inject_at(&leaf.keys, key, idx)
-	small_array.inject_at(&leaf.values, value, idx)
+	assert(get_leaf_num_cells(leaf) < u32(N), "leaf unexpectedly full")
+	leaf_insert_cell(leaf, idx, key, value, N)
 	t.len += 1
 
-	if small_array.len(leaf.keys) < N {
+	if get_leaf_num_cells(leaf) < u32(N) {
 		return
 	}
 
-	leaf_node := find_leaf_node(t, key)
-	right_node, promote := split_leaf(leaf_node)
-	insert_upward(t, path[:path_len], leaf_node, right_node, promote)
+	right_id, promote := split_leaf(t, leaf.id)
+	insert_upward(t, path[:path_len], leaf.id, right_id, promote)
 }
 
 remove :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> (ok: bool) {
 	context.allocator = t.allocator
 
-	path: [MAX_HEIGHT]Path_Entry(K, V, N)
+	path: [MAX_HEIGHT]Path_Entry
 	path_len := 0
 
 	leaf := find_leaf(t, key, path[:], &path_len)
-
-	keys := small_array.slice(&leaf.keys)
+	keys := get_leaf_keys_slice(leaf, K)
 	idx, found := search_key(keys, key)
 	if !found {
-		ok = false
-		return
+		return false
 	}
 
-	small_array.ordered_remove(&leaf.keys, idx)
-	small_array.ordered_remove(&leaf.values, idx)
-
+	leaf_remove_cell(leaf, idx, K, V, N)
 	t.len -= 1
 
-	// root can be empty / underflow
 	if path_len == 0 {
-		ok = true
-		return
+		return true
 	}
 
-	if small_array.len(leaf.keys) >= N / 2 {
-		// NOTE: Decide whether you want to update the key in the parent internal node
-		// in case we just deleted the very first key/value in the leaf node.
-		ok = true
-		return
+	if int(get_leaf_num_cells(leaf)) >= N / 2 {
+		return true
 	}
 
-	// underflowed
 	remove_upward(t, path[:path_len])
 	return true
 }
 
 get :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> (value: V, ok: bool) {
-	if t.root == nil {
+	if t.p == nil || t.root_page == INVALID_PAGE_ID {
 		return {}, false
 	}
 
-	leaf := peek_leaf(t.root, key)
-	keys := small_array.slice(&leaf.keys)
+	leaf := peek_leaf(t, key)
+	keys := get_leaf_keys_slice(leaf, K)
 	idx, found := search_key(keys, key)
 	if !found {
 		return {}, false
 	}
 
-	return small_array.get(leaf.values, idx), true
+	return get_leaf_value(leaf, u32(idx), K, V, N), true
 }
 
-// in-order walk over the leaf sibling chain
+// iterate_leaf walks the leaf sibling chain in key order.
 iterate_leaf :: proc(t: ^$T/Tree($K, $V, $N), visit: proc(key: K, value: V) -> (keep: bool)) {
-	if t.root == nil {
+	if t.p == nil || t.root_page == INVALID_PAGE_ID {
 		return
 	}
 
-	curr := leftmost(t.root)
-	for curr != nil {
-		switch &n in curr^ {
-		case Leaf(K, V, N):
-			for i in 0 ..< small_array.len(n.keys) {
-				if !visit(small_array.get(n.keys, i), small_array.get(n.values, i)) {
-					return
-				}
-			}
-			curr = n.next
+	curr_id := leftmost(t)
+	for curr_id != INVALID_PAGE_ID {
+		page, ok := pager.get_page(t.p, curr_id)
+		assert(ok)
+		assert(get_node_type(page) == .Leaf)
 
-		case Internal(K, V, N):
-			unreachable()
+		n := get_leaf_num_cells(page)
+		for i in 0 ..< n {
+			if !visit(get_leaf_key(page, i, K), get_leaf_value(page, i, K, V, N)) {
+				return
+			}
 		}
+		curr_id = get_leaf_next_leaf(page)
 	}
 }
 
 print :: proc(t: ^$T/Tree($K, $V, $N)) {
-	if t.root == nil {
+	if t.p == nil || t.root_page == INVALID_PAGE_ID {
 		fmt.println("[empty]")
 		return
 	}
-
-	print_node(t.root, "", true)
+	print_page(t, t.root_page, "", true)
 }
 
-// ==== internal helpers ====
+//==== internal helpers ====
 
-// search_key linearly searches sorted `keys` for `key`. It returns the index where
-// `key` is or should be inserted, and whether an exact match was found.
 search_key :: proc(keys: []$K, key: K) -> (index: int, found: bool) {
 	i := 0
 	for i < builtin.len(keys) && keys[i] < key {
 		i += 1
 	}
-
 	if i < builtin.len(keys) && keys[i] == key {
 		return i, true
 	}
-
 	return i, false
 }
 
-// child_index returns the child slot in `node` that should be followed when
-// looking up `key` (the first index i such that `key < keys[i]`, or `len(keys)`).
-child_index :: proc(node: ^Internal($K, $V, $N), key: K) -> int {
-	keys := small_array.slice(&node.keys)
+child_index :: proc(page: ^pager.Page, key: $K) -> int {
+	keys := get_internal_keys_slice(page, K)
 	i := 0
 	for i < builtin.len(keys) && key >= keys[i] {
 		i += 1
@@ -424,275 +431,312 @@ child_index :: proc(node: ^Internal($K, $V, $N), key: K) -> int {
 	return i
 }
 
-// peek_leaf walks from root to the leaf that would hold `key` and returns a pointer
-// to that leaf's payload. It does not record the descent path.
-peek_leaf :: proc(root: ^Node($K, $V, $N), key: K) -> ^Leaf(K, V, N) {
-	curr := root
+peek_leaf :: proc(t: ^Tree($K, $V, $N), key: K) -> ^pager.Page {
+	curr := t.root_page
 	for {
-		switch &n in curr^ {
-		case Leaf(K, V, N):
-			return &n
-		case Internal(K, V, N):
-			curr = small_array.get(n.children, child_index(&n, key))
+		page, ok := pager.get_page(t.p, curr)
+		assert(ok, "peek_leaf: failed to get page")
+
+		switch get_node_type(page) {
+		case .Leaf:
+			return page
+		case .Internal:
+			idx := child_index(page, key)
+			curr = get_internal_child(page, u32(idx), K, N)
 		}
 	}
 }
 
-// find_leaf_node walks the tree to the leaf that would hold `key` and returns
-// the leaf as a ^Node, suitable for structural ops that require a ^Node(K, V, N)
-// object, like splitting and merging.
-find_leaf_node :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> ^Node(K, V, N) {
-	curr := t.root
-	for {
-		switch &n in curr^ {
-		case Leaf(K, V, N):
-			return curr
-		case Internal(K, V, N):
-			curr = small_array.get(n.children, child_index(&n, key))
-		}
-	}
-}
-
-// find_leaf walks the tree to the leaf that would hold `key`, records each internal parent and child
-// index in `path`, and returns a ^Leaf into that node's payload for key/value access.
 find_leaf :: proc(
-	t: ^$T/Tree($K, $V, $N),
+	t: ^Tree($K, $V, $N),
 	key: K,
-	path: []Path_Entry(K, V, N),
+	path: []Path_Entry,
 	path_len: ^int,
-) -> ^Leaf(K, V, N) {
-	curr := t.root
+) -> ^pager.Page {
+	curr := t.root_page
 	path_len^ = 0
 
 	for {
-		switch &n in curr^ {
-		case Leaf(K, V, N):
-			return &n
-		case Internal(K, V, N):
+		page, ok := pager.get_page(t.p, curr)
+		assert(ok, "find_leaf: failed to get page")
+
+		switch get_node_type(page) {
+		case .Leaf:
+			return page
+		case .Internal:
 			assert(path_len^ < builtin.len(path), "tree height exceeded MAX_HEIGHT")
-			idx := child_index(&n, key)
-			path[path_len^] = {curr, idx}
+			idx := child_index(page, key)
+			path[path_len^] = Path_Entry{page_id = curr, index = idx}
 			path_len^ += 1
-			curr = small_array.get(n.children, idx)
+			curr = get_internal_child(page, u32(idx), K, N)
 		}
 	}
 }
 
-// leftmost returns the leftmost leaf under `root` as a `^Node(K, V, N)`, following
-// `children[0]` at each internal node.
-leftmost :: proc(root: ^Node($K, $V, $N)) -> ^Node(K, V, N) {
-	curr := root
+leftmost :: proc(t: ^Tree($K, $V, $N)) -> pager.Page_ID {
+	curr := t.root_page
 	for {
-		switch &n in curr^ {
-		case Leaf(K, V, N):
+		page, ok := pager.get_page(t.p, curr)
+		assert(ok)
+		switch get_node_type(page) {
+		case .Leaf:
 			return curr
-		case Internal(K, V, N):
-			curr = small_array.get(n.children, 0)
+		case .Internal:
+			curr = get_internal_child(page, 0, K, N)
 		}
 	}
 }
 
-// split_leaf splits a full leaf `left_node` at `mid = N / 2` into left and a new
-// right sibling, links them via the leaf node's next pointers, and returns the right node
-// plus the separator key to promote (the first key of the right leaf).
-split_leaf :: proc(left_node: ^Node($K, $V, $N)) -> (right_node: ^Node(K, V, N), promote: K) {
-	left := &left_node.(Leaf(K, V, N))
+leaf_insert_cell :: proc(page: ^pager.Page, idx: int, key: $K, value: $V, $N: int) {
+	n := int(get_leaf_num_cells(page))
+	assert(n < N, "leaf_insert_cell: leaf is full")
+	assert(idx >= 0 && idx <= n)
+
+	keys := get_leaf_keys_cap(page, K, N)
+	vals := get_leaf_values_cap(page, K, V, N)
+	copy(keys[idx + 1:n + 1], keys[idx:n])
+	copy(vals[idx + 1:n + 1], vals[idx:n])
+	keys[idx] = key
+	vals[idx] = value
+	set_leaf_num_cells(page, u32(n + 1))
+}
+
+// leaf_remove_cell removes the key/value at `idx` by shifting following cells left.
+leaf_remove_cell :: proc(page: ^pager.Page, idx: int, $K: typeid, $V: typeid, $N: int) {
+	n := int(get_leaf_num_cells(page))
+	assert(idx >= 0 && idx < n)
+
+	keys := get_leaf_keys_cap(page, K, N)
+	vals := get_leaf_values_cap(page, K, V, N)
+	copy(keys[idx:n - 1], keys[idx + 1:n])
+	copy(vals[idx:n - 1], vals[idx + 1:n])
+	set_leaf_num_cells(page, u32(n - 1))
+}
+
+internal_insert :: proc(page: ^pager.Page, idx: int, key: $K, child_id: pager.Page_ID, $N: int) {
+	n := int(get_internal_num_keys(page))
+	assert(n < N, "internal_insert: node is full")
+	assert(idx >= 0 && idx <= n)
+
+	keys := get_internal_keys_cap(page, K, N)
+	children := get_internal_children_cap(page, K, N)
+	copy(keys[idx + 1:n + 1], keys[idx:n])
+	copy(children[idx + 2:n + 2], children[idx + 1:n + 1])
+	keys[idx] = key
+	children[idx + 1] = child_id
+	set_internal_num_keys(page, u32(n + 1))
+}
+
+// internal_remove removes key at `key_idx` and child at `child_idx`.
+internal_remove :: proc(page: ^pager.Page, key_idx: int, child_idx: int, $K: typeid, $N: int) {
+	n := int(get_internal_num_keys(page))
+	assert(key_idx >= 0 && key_idx < n)
+	assert(child_idx >= 0 && child_idx <= n)
+
+	keys := get_internal_keys_cap(page, K, N)
+	children := get_internal_children_cap(page, K, N)
+	copy(keys[key_idx:n - 1], keys[key_idx + 1:n])
+	copy(children[child_idx:n], children[child_idx + 1:n + 1])
+	set_internal_num_keys(page, u32(n - 1))
+}
+
+split_leaf :: proc(
+	t: ^Tree($K, $V, $N),
+	left_id: pager.Page_ID,
+) -> (
+	right_id: pager.Page_ID,
+	promote: K,
+) {
+	left, ok := pager.get_page(t.p, left_id)
+	assert(ok)
+	assert(get_node_type(left) == .Leaf)
+	assert(int(get_leaf_num_cells(left)) == N)
+
 	mid := N / 2
+	right_id = alloc_leaf_page(t, false, get_parent(left))
+	right, rok := pager.get_page(t.p, right_id)
+	assert(rok)
 
-	right_node = new(Node(K, V, N))
-	right_node^ = Leaf(K, V, N){}
-	right := &right_node.(Leaf(K, V, N))
+	lk := get_leaf_keys_cap(left, K, N)
+	lv := get_leaf_values_cap(left, K, V, N)
+	rk := get_leaf_keys_cap(right, K, N)
+	rv := get_leaf_values_cap(right, K, V, N)
 
-	for i in mid ..< small_array.len(left.keys) {
-		small_array.push(&right.keys, small_array.get(left.keys, i))
-		small_array.push(&right.values, small_array.get(left.values, i))
-	}
+	n_right := N - mid
+	copy(rk[:n_right], lk[mid:N])
+	copy(rv[:n_right], lv[mid:N])
+	set_leaf_num_cells(left, u32(mid))
+	set_leaf_num_cells(right, u32(n_right))
 
-	small_array.resize(&left.keys, mid)
-	small_array.resize(&left.values, mid)
+	set_leaf_next_leaf(right, get_leaf_next_leaf(left))
+	set_leaf_next_leaf(left, right_id)
 
-	right.next = left.next
-	left.next = right_node
-
-	// copy separator into parent
-	promote = small_array.get(right.keys, 0)
+	promote = rk[0]
 	return
 }
 
-// split_internal splits a full internal `left_node` at `mid = N/2`. The middle key is removed
-// and returned as `promote`; keys/children after mid move to the right sibling.
-// The left sibling keeps `keys[0 .. mid)` and `children[0 ..= mid]`.
-split_internal :: proc(left_node: ^Node($K, $V, $N)) -> (right_node: ^Node(K, V, N), promote: K) {
-	left := &left_node.(Internal(K, V, N))
+split_internal :: proc(
+	t: ^Tree($K, $V, $N),
+	left_id: pager.Page_ID,
+) -> (
+	right_id: pager.Page_ID,
+	promote: K,
+) {
+	left, ok := pager.get_page(t.p, left_id)
+	assert(ok)
+	assert(get_node_type(left) == .Internal)
+	assert(int(get_internal_num_keys(left)) == N)
+
 	mid := N / 2
-	promote = small_array.get(left.keys, mid)
+	lk := get_internal_keys_cap(left, K, N)
+	lc := get_internal_children_cap(left, K, N)
+	promote = lk[mid]
 
-	right_node = new(Node(K, V, N))
-	right_node^ = Internal(K, V, N){}
-	right := &right_node.(Internal(K, V, N))
+	right_id = alloc_internal_page(t, false, get_parent(left))
+	right, rok := pager.get_page(t.p, right_id)
+	assert(rok)
 
-	// children[mid+1 ..] move with the right node
-	for i in mid + 1 ..= small_array.len(left.keys) {
-		small_array.push(&right.children, small_array.get(left.children, i))
+	rk := get_internal_keys_cap(right, K, N)
+	rc := get_internal_children_cap(right, K, N)
+
+	n_right := N - mid - 1
+	copy(rk[:n_right], lk[mid + 1:N])
+	copy(rc[:n_right + 1], lc[mid + 1:N + 1])
+	set_internal_num_keys(left, u32(mid))
+	set_internal_num_keys(right, u32(n_right))
+
+	for i in 0 ..= n_right {
+		child, cok := pager.get_page(t.p, rc[i])
+		assert(cok)
+		set_parent(child, right_id)
 	}
-
-	for i in mid + 1 ..< small_array.len(left.keys) {
-		small_array.push(&right.keys, small_array.get(left.keys, i))
-	}
-
-	// left keeps keys[0 .. mid) and children[0 .. mid]
-	small_array.resize(&left.keys, mid)
-	small_array.resize(&left.children, mid + 1)
 	return
 }
 
-
-// insert_upward inserts the separator `key` and sibling `right` into the
-// parents recorded in `path`, splitting full internals as needed. If the
-// ascent reaches past the old root, a new root is allocated.
 insert_upward :: proc(
-	t: ^$T/Tree($K, $V, $N),
-	path: []Path_Entry(K, V, N),
-	left, right: ^Node(K, V, N),
+	t: ^Tree($K, $V, $N),
+	path: []Path_Entry,
+	left_id, right_id: pager.Page_ID,
 	key: K,
 ) {
 	promote := key
-	l, r := left, right
+	l, r := left_id, right_id
 
 	for i := builtin.len(path) - 1; i >= 0; i -= 1 {
-		parent_node := path[i].node
-		parent := &parent_node.(Internal(K, V, N))
-		idx := path[i].index
+		parent_id := path[i].page_id
+		parent, ok := pager.get_page(t.p, parent_id)
+		assert(ok)
 
-		assert(small_array.inject_at(&parent.keys, promote, idx))
-		assert(small_array.inject_at(&parent.children, r, idx + 1))
+		right, rok := pager.get_page(t.p, r)
+		assert(rok)
+		set_parent(right, parent_id)
 
-		if small_array.len(parent.keys) < N {
+		internal_insert(parent, path[i].index, promote, r, N)
+
+		if get_internal_num_keys(parent) < u32(N) {
 			return
 		}
 
-		l = parent_node
-		r, promote = split_internal(parent_node)
+		l = parent_id
+		r, promote = split_internal(t, parent_id)
 	}
 
-	// split the root
-	new_root := new(Node(K, V, N))
-	new_root^ = Internal(K, V, N){}
-	root := &new_root.(Internal(K, V, N))
-	small_array.push(&root.keys, promote)
-	small_array.push(&root.children, l, r)
-	t.root = new_root
+	new_root_id := alloc_internal_page(t, true)
+	new_root, ok := pager.get_page(t.p, new_root_id)
+	assert(ok)
+
+	set_internal_key(new_root, 0, promote)
+	set_internal_child(new_root, 0, l, K, N)
+	set_internal_child(new_root, 1, r, K, N)
+	set_internal_num_keys(new_root, 1)
+
+	left, lok := pager.get_page(t.p, l)
+	right, rok := pager.get_page(t.p, r)
+	assert(lok && rok)
+	set_is_root(left, false)
+	set_is_root(right, false)
+	set_parent(left, new_root_id)
+	set_parent(right, new_root_id)
+
+	t.root_page = new_root_id
 }
 
-// remove_upward repairs underflow along `path` from the leaf's parent toward the root.
-// At each level: borrow from a sibling if possible; otherwise merge. If the ascent
-// empties the root of keys, shrink_root collapses it to its sole child.
-remove_upward :: proc(t: ^$T/Tree($K, $V, $N), path: []Path_Entry(K, V, N)) {
+remove_upward :: proc(t: ^Tree($K, $V, $N), path: []Path_Entry) {
 	min_keys := N / 2
 
 	for i := builtin.len(path) - 1; i >= 0; i -= 1 {
-		parent_node := path[i].node
-		parent := &parent_node.(Internal(K, V, N))
+		parent_id := path[i].page_id
+		parent, ok := pager.get_page(t.p, parent_id)
+		assert(ok)
 		idx := path[i].index
 
-		// try borrow
-		if try_borrow(parent, idx) do return
+		if try_borrow(t, parent, idx) {
+			return
+		}
 
-		merge_with_sibling(parent, idx)
+		merge_with_sibling(t, parent, idx)
 
-		if i == 0 do break // falls through to shrink root
+		if i == 0 {
+			break
+		}
 
-		// check if parent is in valid shape.
-		if small_array.len(parent.keys) >= min_keys do return
+		if int(get_internal_num_keys(parent)) >= min_keys {
+			return
+		}
 	}
 
 	shrink_root(t)
 }
 
-try_borrow :: proc(parent: ^Internal($K, $V, $N), idx: int) -> bool {
-	child := small_array.get(parent.children, idx)
-	switch _ in child^ {
-	case Leaf(K, V, N):
-		return try_borrow_leaf(parent, idx)
-	case Internal(K, V, N):
-		return try_borrow_internal(parent, idx)
+try_borrow :: proc(t: ^Tree($K, $V, $N), parent: ^pager.Page, idx: int) -> bool {
+	child_id := get_internal_child(parent, u32(idx), K, N)
+	child, ok := pager.get_page(t.p, child_id)
+	assert(ok)
+
+	switch get_node_type(child) {
+	case .Leaf:
+		return try_borrow_leaf(t, parent, idx)
+	case .Internal:
+		return try_borrow_internal(t, parent, idx)
 	}
 	return false
 }
 
-try_borrow_leaf :: proc(parent: ^Internal($K, $V, $N), idx: int) -> bool {
+try_borrow_leaf :: proc(t: ^Tree($K, $V, $N), parent: ^pager.Page, idx: int) -> bool {
 	min_keys := N / 2
-	curr := &small_array.get(parent.children, idx).(Leaf(K, V, N))
+	n_children := int(get_internal_num_keys(parent)) + 1
+
+	curr_id := get_internal_child(parent, u32(idx), K, N)
+	curr, ok := pager.get_page(t.p, curr_id)
+	assert(ok)
 
 	// right sibling
-	if idx + 1 < small_array.len(parent.children) {
-		right_node := small_array.get(parent.children, idx + 1)
-		right := &right_node.(Leaf(K, V, N))
-		if small_array.len(right.keys) > min_keys {
-			// take right's first / smallest entry
-			assert(small_array.push(&curr.keys, small_array.get(right.keys, 0)))
-			assert(small_array.push(&curr.values, small_array.get(right.values, 0)))
-
-			small_array.ordered_remove(&right.keys, 0)
-			small_array.ordered_remove(&right.values, 0)
-
-			// update parent separator
-			small_array.set(&parent.keys, idx, small_array.get(right.keys, 0))
-			return true
-		}
-	}
-
-	if idx > 0 {
-		left_node := small_array.get(parent.children, idx - 1)
-		left := &left_node.(Leaf(K, V, N))
-		if small_array.len(left.keys) > min_keys {
-			k := small_array.pop_back(&left.keys)
-			v := small_array.pop_back(&left.values)
-			assert(small_array.push_front(&curr.keys, k))
-			assert(small_array.push_front(&curr.values, v))
-
-			// update parent separator
-			small_array.set(&parent.keys, idx - 1, k)
-			return true
-		}
-	}
-
-	return false
-}
-
-try_borrow_internal :: proc(parent: ^Internal($K, $V, $N), idx: int) -> bool {
-	min_keys := N / 2
-	curr := &small_array.get(parent.children, idx).(Internal(K, V, N))
-
-	// right sibling
-	if idx + 1 < small_array.len(parent.children) {
-		right_node := small_array.get(parent.children, idx + 1)
-		right := &right_node.(Internal(K, V, N))
-		// check if sibling has extra key
-		if small_array.len(right.keys) > min_keys {
-			assert(small_array.push(&curr.keys, small_array.get(parent.keys, idx)))
-			assert(small_array.push(&curr.children, small_array.get(right.children, 0)))
-
-			// right's first key up into parent
-			small_array.set(&parent.keys, idx, small_array.get(right.keys, 0))
-			small_array.ordered_remove(&right.keys, 0)
-			small_array.ordered_remove(&right.children, 0)
+	if idx + 1 < n_children {
+		right_id := get_internal_child(parent, u32(idx + 1), K, N)
+		right, rok := pager.get_page(t.p, right_id)
+		assert(rok)
+		if int(get_leaf_num_cells(right)) > min_keys {
+			rk := get_leaf_keys_cap(right, K, N)
+			rv := get_leaf_values_cap(right, K, V, N)
+			leaf_insert_cell(curr, int(get_leaf_num_cells(curr)), rk[0], rv[0], N)
+			leaf_remove_cell(right, 0, K, V, N)
+			set_internal_key(parent, u32(idx), get_leaf_key(right, 0, K))
 			return true
 		}
 	}
 
 	// left sibling
 	if idx > 0 {
-		left_node := small_array.get(parent.children, idx - 1)
-		left := &left_node.(Internal(K, V, N))
-		if small_array.len(left.keys) > min_keys {
-			sep := small_array.get(parent.keys, idx - 1)
-			up := small_array.pop_back(&left.keys)
-			child := small_array.pop_back(&left.children)
-
-			assert(small_array.push_front(&curr.keys, sep))
-			assert(small_array.push_front(&curr.children, child))
-			small_array.set(&parent.keys, idx - 1, up)
+		left_id := get_internal_child(parent, u32(idx - 1), K, N)
+		left, lok := pager.get_page(t.p, left_id)
+		assert(lok)
+		if int(get_leaf_num_cells(left)) > min_keys {
+			ln := int(get_leaf_num_cells(left))
+			k := get_leaf_key(left, u32(ln - 1), K)
+			v := get_leaf_value(left, u32(ln - 1), K, V, N)
+			leaf_remove_cell(left, ln - 1, K, V, N)
+			leaf_insert_cell(curr, 0, k, v, N)
+			set_internal_key(parent, u32(idx - 1), k)
 			return true
 		}
 	}
@@ -700,97 +744,176 @@ try_borrow_internal :: proc(parent: ^Internal($K, $V, $N), idx: int) -> bool {
 	return false
 }
 
-// shrink_root replaces an internal root that has no keys (one child) with that child.
-shrink_root :: proc(t: ^$T/Tree($K, $V, $N)) {
-	#partial switch &n in t.root^ {
-	case Internal(K, V, N):
-		if small_array.len(n.keys) == 0 {
-			assert(small_array.len(n.children) == 1)
-			only := small_array.get(n.children, 0)
-			old := t.root
-			t.root = only
-			free(old)
+try_borrow_internal :: proc(t: ^Tree($K, $V, $N), parent: ^pager.Page, idx: int) -> bool {
+	min_keys := N / 2
+	n_children := int(get_internal_num_keys(parent)) + 1
+
+	curr_id := get_internal_child(parent, u32(idx), K, N)
+	curr, ok := pager.get_page(t.p, curr_id)
+	assert(ok)
+
+	// right sibling
+	if idx + 1 < n_children {
+		right_id := get_internal_child(parent, u32(idx + 1), K, N)
+		right, rok := pager.get_page(t.p, right_id)
+		assert(rok)
+		if int(get_internal_num_keys(right)) > min_keys {
+			sep := get_internal_key(parent, u32(idx), K)
+			child0 := get_internal_child(right, 0, K, N)
+
+			cn := int(get_internal_num_keys(curr))
+			ck := get_internal_keys_cap(curr, K, N)
+			cc := get_internal_children_cap(curr, K, N)
+			ck[cn] = sep
+			cc[cn + 1] = child0
+			set_internal_num_keys(curr, u32(cn + 1))
+
+			moved, mok := pager.get_page(t.p, child0)
+			assert(mok)
+			set_parent(moved, curr_id)
+
+			set_internal_key(parent, u32(idx), get_internal_key(right, 0, K))
+			internal_remove(right, 0, 0, K, N)
+			return true
 		}
 	}
-}
 
-merge_with_sibling :: proc(parent: ^Internal($K, $V, $N), idx: int) {
+	// left sibling
 	if idx > 0 {
-		merge_children(parent, idx - 1, idx)
+		left_id := get_internal_child(parent, u32(idx - 1), K, N)
+		left, lok := pager.get_page(t.p, left_id)
+		assert(lok)
+		if int(get_internal_num_keys(left)) > min_keys {
+			sep := get_internal_key(parent, u32(idx - 1), K)
+			ln := int(get_internal_num_keys(left))
+			up := get_internal_key(left, u32(ln - 1), K)
+			child := get_internal_child(left, u32(ln), K, N)
+
+			cn := int(get_internal_num_keys(curr))
+			ck := get_internal_keys_cap(curr, K, N)
+			cc := get_internal_children_cap(curr, K, N)
+			copy(ck[1:cn + 1], ck[0:cn])
+			copy(cc[1:cn + 2], cc[0:cn + 1])
+			ck[0] = sep
+			cc[0] = child
+			set_internal_num_keys(curr, u32(cn + 1))
+
+			moved, mok := pager.get_page(t.p, child)
+			assert(mok)
+			set_parent(moved, curr_id)
+
+			set_internal_key(parent, u32(idx - 1), up)
+			internal_remove(left, ln - 1, ln, K, N)
+			return true
+		}
+	}
+
+	return false
+}
+
+merge_with_sibling :: proc(t: ^Tree($K, $V, $N), parent: ^pager.Page, idx: int) {
+	if idx > 0 {
+		merge_children(t, parent, idx - 1, idx)
 	} else {
-		merge_children(parent, idx, idx + 1)
+		merge_children(t, parent, idx, idx + 1)
 	}
 }
 
-merge_children :: proc(parent: ^Internal($K, $V, $N), left_idx, right_idx: int) {
+merge_children :: proc(t: ^Tree($K, $V, $N), parent: ^pager.Page, left_idx, right_idx: int) {
 	assert(right_idx == left_idx + 1)
-	left_node := small_array.get(parent.children, left_idx)
-	right_node := small_array.get(parent.children, right_idx)
 
-	switch &left in left_node^ {
-	case Leaf(K, V, N):
-		right := &right_node.(Leaf(K, V, N))
-		for i in 0 ..< small_array.len(right.keys) {
-			assert(small_array.push(&left.keys, small_array.get(right.keys, i)))
-			assert(small_array.push(&left.values, small_array.get(right.values, i)))
+	left_id := get_internal_child(parent, u32(left_idx), K, N)
+	right_id := get_internal_child(parent, u32(right_idx), K, N)
+	left, lok := pager.get_page(t.p, left_id)
+	right, rok := pager.get_page(t.p, right_id)
+	assert(lok && rok)
+
+	switch get_node_type(left) {
+	case .Leaf:
+		assert(get_node_type(right) == .Leaf)
+		rn := int(get_leaf_num_cells(right))
+		rk := get_leaf_keys_cap(right, K, N)
+		rv := get_leaf_values_cap(right, K, V, N)
+		for i in 0 ..< rn {
+			leaf_insert_cell(left, int(get_leaf_num_cells(left)), rk[i], rv[i], N)
 		}
+		set_leaf_next_leaf(left, get_leaf_next_leaf(right))
 
-		left.next = right.next
+	case .Internal:
+		assert(get_node_type(right) == .Internal)
+		sep := get_internal_key(parent, u32(left_idx), K)
+		ln := int(get_internal_num_keys(left))
+		lk := get_internal_keys_cap(left, K, N)
+		lc := get_internal_children_cap(left, K, N)
+		lk[ln] = sep
+		set_internal_num_keys(left, u32(ln + 1))
 
-	case Internal(K, V, N):
-		right := &right_node.(Internal(K, V, N))
-		// the parent's separator/pointer comes down into the left node
-		assert(small_array.push(&left.keys, small_array.get(parent.keys, left_idx)))
-		for i in 0 ..< small_array.len(right.keys) {
-			assert(small_array.push(&left.keys, small_array.get(right.keys, i)))
-		}
+		rn := int(get_internal_num_keys(right))
+		rk := get_internal_keys_cap(right, K, N)
+		rc := get_internal_children_cap(right, K, N)
 
-		for i in 0 ..< small_array.len(right.children) {
-			assert(small_array.push(&left.children, small_array.get(right.children, i)))
+		ln = int(get_internal_num_keys(left))
+		copy(lk[ln:ln + rn], rk[:rn])
+		copy(lc[ln:ln + rn + 1], rc[:rn + 1])
+		set_internal_num_keys(left, u32(ln + rn))
+
+		for i in 0 ..= rn {
+			child, cok := pager.get_page(t.p, rc[i])
+			assert(cok)
+			set_parent(child, left_id)
 		}
 	}
 
-	small_array.ordered_remove(&parent.keys, left_idx)
-	small_array.ordered_remove(&parent.children, right_idx)
-	free(right_node)
+	internal_remove(parent, left_idx, right_idx, K, N)
+	// TODO: return right_id to a free list
 }
 
-// destroy_node recursively frees `n` and its descendants.
-destroy_node :: proc(n: ^Node($K, $V, $N)) {
-	if n == nil {
+shrink_root :: proc(t: ^Tree($K, $V, $N)) {
+	root, ok := pager.get_page(t.p, t.root_page)
+	assert(ok)
+	if get_node_type(root) != .Internal {
+		return
+	}
+	if get_internal_num_keys(root) != 0 {
 		return
 	}
 
-	switch &v in n^ {
-	case Internal(K, V, N):
-		for i in 0 ..< small_array.len(v.children) {
-			destroy_node(small_array.get(v.children, i))
-		}
-	case Leaf(K, V, N):
-
-	}
-
-	free(n)
+	only := get_internal_child(root, 0, K, N)
+	child, cok := pager.get_page(t.p, only)
+	assert(cok)
+	set_is_root(child, true)
+	set_parent(child, INVALID_PAGE_ID)
+	t.root_page = only
+	// TODO: return old root to a free list
 }
 
-// print_node recursively prints the subtree at `n` as an ASCII tree.
-print_node :: proc(n: ^Node($K, $V, $N), prefix: string, is_last: bool) {
+print_page :: proc(t: ^Tree($K, $V, $N), page_id: pager.Page_ID, prefix: string, is_last: bool) {
+	page, ok := pager.get_page(t.p, page_id)
+	assert(ok)
+
 	branch := is_last ? "└── " : "├── "
-	switch &v in n^ {
-	case Leaf(K, V, N):
+	switch get_node_type(page) {
+	case .Leaf:
 		fmt.printf(
-			"%s%sleaf keys=%v values=%v\n",
+			"%s%sleaf id=%v keys=%v\n",
 			prefix,
 			branch,
-			small_array.slice(&v.keys),
-			small_array.slice(&v.values),
+			page_id,
+			get_leaf_keys_slice(page, K),
 		)
-	case Internal(K, V, N):
-		fmt.printf("%s%sinternal keys=%v\n", prefix, branch, small_array.slice(&v.keys))
+	case .Internal:
+		fmt.printf(
+			"%s%sinternal id=%v keys=%v\n",
+			prefix,
+			branch,
+			page_id,
+			get_internal_keys_slice(page, K),
+		)
 		child_prefix := is_last ? prefix + "    " : prefix + "│   "
-		count := small_array.len(v.children)
+		count := int(get_internal_num_keys(page)) + 1
 		for i in 0 ..< count {
-			print_node(small_array.get(v.children, i), child_prefix, i == count - 1)
+			child_id := get_internal_child(page, u32(i), K, N)
+			print_page(t, child_id, child_prefix, i == count - 1)
 		}
 	}
 }
