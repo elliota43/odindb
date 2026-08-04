@@ -107,6 +107,35 @@ remove :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> (ok: bool) {
 	path_len := 0
 
 	leaf := find_leaf(t, key, path[:], &path_len)
+
+	keys := small_array.slice(&leaf.keys)
+	idx, found := search_key(keys, key)
+	if !found {
+		ok = false
+		return
+	}
+
+	small_array.ordered_remove(&leaf.keys, idx)
+	small_array.ordered_remove(&leaf.values, idx)
+
+	t.len -= 1
+
+	// root can be empty / underflow
+	if path_len == 0 {
+		ok = true
+		return
+	}
+
+	if small_array.len(&leaf.keys) >= N / 2 {
+		// NOTE: Decide whether you want to update the key in the parent internal node
+		// in case we just deleted the very first key/value in the leaf node.
+		ok = true
+		return
+	}
+
+	// underflowed
+	remove_upward(t, &path[:path_len])
+	return true
 }
 
 get :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> (value: V, ok: bool) {
@@ -175,7 +204,16 @@ search_key :: proc(keys: []$K, key: K) -> (index: int, found: bool) {
 
 // child_index returns the child slot in `node` that should be followed when
 // looking up `key` (the first index i such that `key < key[i]`, or `len(keys)`).
-child_index :: proc(node: ^Internal($K, $V, $N), key: K) -> int {
+child_index :: proc(
+	node: ^Internal($K, $V, $N),
+	key: K,
+) -> // peek_leaf walks from root to the leaf that would hold key and returns a pointer
+	// to that leaf's payload. It does not record the descent path.
+
+
+	// find_leaf_node walks the tree to the leaf that would hold key and returns
+	// the leaf as a ^Node, suitable for structural ops that require a ^Node(K, V, N)
+	int {// object, like splitting and merging.
 	keys := small_array.slice(&node.keys)
 	i := 0
 	for i < builtin.len(keys) && key >= keys[i] {
@@ -184,8 +222,7 @@ child_index :: proc(node: ^Internal($K, $V, $N), key: K) -> int {
 	return i
 }
 
-// peek_leaf walks from root to the leaf that would hold key and returns a pointer
-// to that leaf's payload. It does not record the descent path.
+
 peek_leaf :: proc(root: ^Node($K, $V, $N), key: K) -> ^Leaf(K, V, N) {
 	curr := root
 	for {
@@ -198,9 +235,7 @@ peek_leaf :: proc(root: ^Node($K, $V, $N), key: K) -> ^Leaf(K, V, N) {
 	}
 }
 
-// find_leaf_node walks the tree to the leaf that would hold key and returns
-// the leaf as a ^Node, suitable for structural ops that require a ^Node(K, V, N)
-// object, like splitting and merging.
+
 find_leaf_node :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> ^Node(K, V, N) {
 	curr := t.root
 	for {
@@ -342,6 +377,173 @@ insert_upward :: proc(
 	small_array.push(&root.keys, promote)
 	small_array.push(&root.children, l, r)
 	t.root = new_root
+}
+
+remove_upward :: proc(t: ^$T/Tree($K, $V, $N), path: []Path_Entry(K, V, N), node: ^Node(K, V, N)) {
+	min_keys := N / 2
+
+	for i := builtin.len(path) - 1; i >= 0; i -= 1 {
+		parent_node := path[i].node
+		parent := &parent_node.(Internal(K, V, N))
+		idx := path[i].index
+
+		// try borrow
+		if try_borrow(parent, idx) do return
+
+		merge_with_sibling(parent, idx)
+
+		if i == 0 do break // falls through to shrink root
+
+		// check if parent is in valid shape.
+		if small_array.len(parent.keys) >= min_keys do return
+	}
+
+	shrink_root(t)
+}
+
+try_borrow :: proc(parent: ^Internal($K, $V, $N), idx: int) -> bool {
+	child := small_array.get(parent.children, idx)
+	switch child^ {
+	case Leaf(K, V, N):
+		return try_borrow_leaf(parent, idx)
+	case Internal(K, V, N):
+		return try_borrow_internal(parent, idx)
+	}
+	return false
+}
+
+try_borrow_leaf :: proc(parent: ^Internal($K, $V, $N), idx: int) -> bool {
+	min_keys := N / 2
+	curr := &small_array.get(parent.children, idx).(Leaf(K, V, N))
+
+	// right sibling
+	if idx + 1 < small_array.len(parent.children) {
+		right_node := small_array.get(parent.children, idx + 1)
+		right := &right_node.(Leaf(K, V, N))
+		if small_array.len(right.keys) > min_keys {
+			// take right's first / smallest entry
+			assert(small_array.push(&curr.keys, small_array.get(right.keys, 0)))
+			assert(small_array.push(&curr.values, small_array.get(right.values, 0)))
+
+			small_array.ordered_remove(&right.keys, 0)
+			small_array.ordered_remove(&right.values, 0)
+
+			// update parent separator
+			small_array.set(&parent.keys, idx, small_array.get(right.keys, 0))
+			return true
+		}
+	}
+
+	if idx > 0 {
+		left_node := small_array.get(parent.children, idx - 1)
+		left := &left_node.(Leaf(K, V, N))
+		if small_array.len(left.keys) > min_keys {
+			k := small_array.pop_back(&left.keys)
+			v := small_array.pop_back(&left.values)
+			assert(small_array.push_front(&curr.keys, k))
+			assert(small_array.push_front(&curr.values, v))
+
+			// update parent separator
+			small_array.set(&parent.keys, idx - 1, k)
+			return true
+		}
+	}
+
+	return false
+}
+
+try_borrow_internal :: proc(parent: ^Internal($K, $V, $N), idx: int) -> bool {
+	min_keys := N / 2
+	curr := &small_array.get(parent.children, idx).(Internal(K, V, N))
+
+	// right sibling
+	if idx + 1 < small_array.len(parent.children) {
+		right_node := small_array.get(parent.children, idx + 1)
+		right := &right_node.(Internal(K, V, N))
+		// check if sibling has extra key
+		if small_array.len(right.keys) > min_keys {
+			assert(small_array.push(&curr.keys, small_array.get(parent.keys, idx)))
+			assert(small_array.push(&curr.children, small_array.get(right.children, 0)))
+
+			// right's first key up into parent
+			small_array.set(&parent.keys, idx, small_array.get(right.keys, 0))
+			small_array.ordered_remove(&right.keys, 0)
+			small_array.ordered_remove(&right.children, 0)
+			return true
+		}
+	}
+
+	// left sibling
+	if idx > 0 {
+		left_node := small_array.get(parent.children, idx - 1)
+		left := &left_node.(Internal(K, V, N))
+		if small_array.len(left.keys) > min_keys {
+			sep := small_array.get(parent.keys, idx - 1)
+			up := small_array.pop_back(&left.keys)
+			child := small_array.pop_back(&left.children)
+
+			assert(small_array.push_front(&curr.keys, sep))
+			assert(small_array.push_front(&curr.children, child))
+			small_array.set(&parent.keys, idx - 1, up)
+			return true
+		}
+	}
+
+	return false
+}
+
+shrink_root :: proc(t: ^$T/Tree($K, $V, $N)) {
+	switch &n in t.root^ {
+	case Internal(K, V, N):
+		if small_array.len(n.keys) == 0 {
+			assert(small_array.len(n.children) == 1)
+			only := small_array.get(n.children, 0)
+			old := t.root
+			t.root = only
+			free(old)
+		}
+	}
+}
+
+merge_with_sibling :: proc(parent: ^Internal($K, $V, $N), idx: int) {
+	if idx > 0 {
+		merge_children(parent, idx - 1, idx)
+	} else {
+		merge_children(parent, idx, idx + 1)
+	}
+}
+
+merge_children :: proc(parent: ^Internal($K, $V, $N), left_idx, right_idx: int) {
+	assert(right_idx == left_idx + 1)
+	left_node := small_array.get(parent.children, left_idx)
+	right_node := small_array.get(parent.children, right_idx)
+
+	switch &left in left_node^ {
+	case Leaf(K, V, N):
+		right := &right_node.(Leaf(K, V, N))
+		for i in 0 ..< small_array.len(right.keys) {
+			assert(small_array.push(&left.keys, small_array.get(right.keys, i)))
+			assert(small_array.push(&left.values, small_array.get(right.values, i)))
+		}
+
+		left.next = right.next
+
+	case Internal(K, V, N):
+		right := &right_node.(Internal(K, V, N))
+		// the parent's separator/pointer comes down into the left node
+		assert(small_array.push(&left.keys, small_array.get(parent.keys, left_idx)))
+		for i in 0 ..< small_array.len(right.keys) {
+			assert(small_array.push(&left.keys, small_array.get(right.keys, i)))
+		}
+
+		for i in 0 ..< small_array.len(right.children) {
+			assert(small_array.push(&left.children, small_array.get(right.children, i)))
+		}
+	}
+
+	small_array.ordered_remove(&parent.keys, left_idx)
+	small_array.ordered_remove(&parent.children, right_idx)
+	free(right_node)
 }
 
 // destroy_node recursively frees `n` and its descendants.
