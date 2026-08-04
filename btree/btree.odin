@@ -1,10 +1,12 @@
 package btree
 
+import "../pager"
 import "base:builtin"
 import "base:intrinsics"
 import "core:container/small_array"
 import "core:fmt"
 import "core:mem"
+
 /*
    B+Tree
 
@@ -12,48 +14,258 @@ import "core:mem"
    Inserting the ORDERith key causes a split.
 */
 
+Node_Type :: enum u8 {
+	Internal = 0,
+	Leaf     = 1,
+}
+
+// === COMMON HEADERS ===
+
+NODE_TYPE_OFFSET :: 0
+NODE_TYPE_SIZE :: 1 // Node_Type (u8)
+IS_ROOT_OFFSET :: 1
+IS_ROOT_SIZE :: 1 // bool
+PARENT_POINTER_OFFSET :: 2
+PARENT_POINTER_SIZE :: 4
+COMMON_HEADER_SIZE :: NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE
+
+//=== LEAF NODE HEADER ===
+LEAF_NUM_CELLS_OFFSET :: COMMON_HEADER_SIZE
+LEAF_NUM_CELLS_SIZE :: 4
+LEAF_NEXT_LEAF_OFFSET :: LEAF_NUM_CELLS_OFFSET + LEAF_NUM_CELLS_SIZE
+LEAF_NEXT_LEAF_SIZE :: 4
+LEAF_HEADER_SIZE :: COMMON_HEADER_SIZE + LEAF_NUM_CELLS_SIZE + LEAF_NEXT_LEAF_SIZE
+
+//=== INTERNAL NODE HEADER ===
+INTERNAL_NUM_KEYS_OFFSET :: COMMON_HEADER_SIZE
+INTERNAL_NUM_KEYS_SIZE :: 4
+
+INTERNAL_HEADER_SIZE :: COMMON_HEADER_SIZE + INTERNAL_NUM_KEYS_SIZE
+
+//=== COMMON HELPERS ===
+
+// INVALID_PAGE_ID represents a "nil" page id pointer.
+INVALID_PAGE_ID :: pager.Page_ID(0xFFFF_FFFF)
+
+
+get_node_type :: proc(page: ^pager.Page) -> Node_Type {
+	return Node_Type(page.data[NODE_TYPE_OFFSET])
+}
+
+set_node_type :: proc(page: ^pager.Page, type: Node_Type) {
+	page.data[NODE_TYPE_OFFSET] = u8(type)
+}
+
+get_parent :: proc(page: ^pager.Page) -> pager.Page_ID {
+	ptr := (^u32)(&page.data[PARENT_POINTER_OFFSET])
+	return pager.Page_ID(ptr^)
+}
+
+set_parent :: proc(page: ^pager.Page, parent_id: pager.Page_ID) {
+	ptr := (^u32)(&page.data[PARENT_POINTER_OFFSET])
+	ptr^ = u32(parent_id)
+}
+
+get_is_root :: proc(page: ^pager.Page) -> bool {
+	return bool(page.data[IS_ROOT_OFFSET])
+}
+
+set_is_root :: proc(page: ^pager.Page, is_root: bool) {
+	page.data[IS_ROOT_OFFSET] = u8(is_root)
+}
+
+//=== LEAF HELPERS ===
+
+get_leaf_num_cells :: proc(page: ^pager.Page) -> u32 {
+	ptr := (^u32)(&page.data[LEAF_NUM_CELLS_OFFSET])
+	return ptr^
+}
+
+set_leaf_num_cells :: proc(page: ^pager.Page, num: u32) {
+	ptr := (^u32)(&page.data[LEAF_NUM_CELLS_OFFSET])
+	ptr^ = num
+}
+
+get_leaf_next_leaf :: proc(page: ^pager.Page) -> pager.Page_ID {
+	ptr := (^u32)(&page.data[LEAF_NEXT_LEAF_OFFSET])
+	return pager.Page_ID(ptr^)
+}
+
+set_leaf_next_leaf :: proc(page: ^pager.Page, next_leaf: pager.Page_ID) {
+	ptr := (^u32)(&page.data[LEAF_NEXT_LEAF_OFFSET])
+	ptr^ = u32(next_leaf)
+}
+
 Tree :: struct($K: typeid, $V: typeid, $N: int) where intrinsics.type_is_ordered_numeric(K),
 	N >= 3 {
-	root:      ^Node(K, V, N),
+	p:         ^pager.Pager,
+	root_page: pager.Page_ID,
 	allocator: mem.Allocator,
 	len:       int,
 }
 
-Node :: union($K: typeid, $V: typeid, $N: int) {
-	Leaf(K, V, N),
-	Internal(K, V, N),
-}
-
-Leaf :: struct($K: typeid, $V: typeid, $N: int) {
-	keys:   small_array.Small_Array(N, K),
-	values: small_array.Small_Array(N, V),
-	next:   ^Node(K, V, N),
-}
-
-Internal :: struct($K: typeid, $V: typeid, $N: int) {
-	keys:     small_array.Small_Array(N, K),
-	children: small_array.Small_Array(N + 1, ^Node(K, V, N)),
-}
-
-Path_Entry :: struct($K: typeid, $V: typeid, $N: int) {
-	node:  ^Node(K, V, N),
-	index: int,
+Path_Entry :: struct {
+	page_id: pager.Page_ID,
+	index:   int,
 }
 
 MAX_HEIGHT :: 64
 
+//=== LEAF NODE ARRAYS ===
+// Layout: [Header] [Keys...] [Values...]
+
+get_leaf_key :: proc(page: ^pager.Page, index: u32, $K: typeid) -> K {
+	// Offset = Header Size + (index * Size of Key)
+	offset := LEAF_HEADER_SIZE + (index * u32(size_of(K)))
+	ptr := (^K)(&page.data[offset])
+	return ptr^
+}
+
+set_leaf_key :: proc(page: ^pager.Page, index: u32, key: $K) {
+	offset := LEAF_HEADER_SIZE + (index * u32(size_of(K)))
+	ptr := (^K)(&page.data[offset])
+	ptr^ = key
+}
+
+get_leaf_value :: proc(page: ^pager.Page, index: u32, $K: typeid, $V: typeid, $N: int) -> V {
+	// Offset = Header + (Max Keys * Size of Key) + (index * Size of Value)
+	keys_size := u32(N * size_of(K))
+	offset := LEAF_HEADER_SIZE + keys_size + (index * u32(size_of(V)))
+	ptr := (^V)(&page.data[offset])
+	return ptr^
+}
+
+set_leaf_value :: proc(page: ^pager.Page, index: u32, value: $V, $K: typeid, $N: int) {
+	keys_size := u32(N * size_of(K))
+	offset := LEAF_HEADER_SIZE + keys_size + (index * u32(size_of(V)))
+	ptr := (^V)(&page.data[offset])
+	ptr^ = value
+}
+
+//=== INTERNAL NODE ARRAYS ===
+// Layout: [Header] [Keys Array] [Children Page_IDs Array]
+
+get_internal_key :: proc(page: ^pager.Page, index: u32, $K: typeid) -> K {
+	offset := INTERNAL_HEADER_SIZE + (index * u32(size_of(K)))
+	ptr := (^K)(&page.data[offset])
+	return ptr^
+}
+
+set_internal_key :: proc(page: ^pager.Page, index: u32, key: $K) {
+	offset := INTERNAL_HEADER_SIZE + (index * u32(size_of(K)))
+	ptr := (^K)(&page.data[offset])
+	ptr^ = key
+}
+
+get_internal_child :: proc(page: ^pager.Page, index: u32, $K: typeid, $N: int) -> pager.Page_ID {
+	// children array comes after the keys array
+	keys_size := u32(N * size_of(K))
+	offset := INTERNAL_HEADER_SIZE + keys_size + (index * u32(size_of(pager.Page_ID)))
+	ptr := (^pager.Page_ID)(&page.data[offset])
+	return ptr^
+}
+
+set_internal_child :: proc(
+	page: ^pager.Page,
+	index: u32,
+	child_id: pager.Page_ID,
+	$K: typeid,
+	$N: int,
+) {
+	keys_size := u32(N * size_of(K))
+	offset := INTERNAL_HEADER_SIZE + keys_size + (index * u32(size_of(pager.Page_ID)))
+	ptr := (^pager.Page_ID)(&page.data[offset])
+	ptr^ = child_id
+}
+
+// get_leaf_keys_slice returns a slice of the keys from the leaf's page.
+get_leaf_keys_slice :: proc(page: ^pager.Page, $K: typeid) -> []K {
+	num_cells := get_leaf_num_cells(page)
+	ptr := (^K)(&page.data[LEAF_HEADER_SIZE])
+	// cast ptr to unbounded ptr then slice
+	return (cast([^]K)ptr)[:num_cells]
+}
+
+get_internal_keys_slice :: proc(page: ^pager.Page, $K: typeid) -> []K {
+	num_keys := get_internal_num_keys(page)
+	ptr := (^K)(&page.data[INTERNAL_HEADER_SIZE])
+	return (cast([^]K)ptr)[:num_keys]
+}
+
+get_internal_num_keys :: proc(page: ^pager.Page) -> u32 {
+	ptr := (^u32)(&page.data[INTERNAL_NUM_KEYS_OFFSET])
+	return ptr^
+}
+
+set_internal_num_keys :: proc(page: ^pager.Page, num: u32) {
+	ptr := (^u32)(&page.data[INTERNAL_NUM_KEYS_OFFSET])
+	ptr^ = num
+}
+
+
+// alloc_leaf_page gets a new page from the pager and formats it as a leaf.
+// When `is_root` is true, parent is forced to INVALID_PAGE_ID.
+alloc_leaf_page :: proc(
+	t: ^Tree($K, $V, $N),
+	is_root: bool,
+	parent := INVALID_PAGE_ID,
+) -> pager.Page_ID {
+	// TODO: implement free list for deleted pages and look there first
+	page, new_id, ok := pager.alloc_page(t.p)
+	assert(ok, "failed to allocate new page from pager")
+
+	mem.zero_slice(page.data[:])
+
+	set_node_type(page, .Leaf)
+	set_is_root(page, is_root)
+	set_parent(page, INVALID_PAGE_ID)
+	set_leaf_next_leaf(page, INVALID_PAGE_ID)
+	set_leaf_num_cells(page, 0)
+
+	return new_id
+}
+
+alloc_internal_page :: proc(
+	t: ^Tree($K, $V, $N),
+	is_root: bool,
+	parent := INVALID_PAGE_ID,
+) -> pager.Page_ID {
+	page, new_id, ok := pager.alloc_page(t.p)
+	assert(ok, "failed to allocate new page from pager")
+
+	mem.zero_slice(page.data[:])
+
+	set_node_type(page, .Internal)
+	set_is_root(page, is_root)
+	set_parent(page, INVALID_PAGE_ID if is_root else parent)
+	set_internal_num_keys(page, 0)
+
+	return new_id
+}
+
 init :: proc(
 	t: ^$T/Tree($K, $V, $N),
+	p: ^pager.Pager,
 	allocator := context.allocator,
 ) where intrinsics.type_is_ordered_numeric(K),
-	N >= 3 {
+	N >=
+	3 {
+
+	assert(
+		LEAF_HEADER_SIZE + (N * size_of(K)) + (N * size_of(V)) <= pager.PAGE_SIZE,
+		"Leaf node exceeds 4KB page size.",
+	)
+
+	assert(
+		INTERNAL_HEADER_SIZE + (N * size_of(K)) + ((N + 1) * size_of(pager.Page_ID)) <=
+		pager.PAGE_SIZE,
+		"Internal node exceeds 4KB page size.",
+	)
+
 	context.allocator = allocator
 	t.allocator = allocator
+	t.p = p
 	t.len = 0
-
-	root := new(Node(K, V, N))
-	root^ = Leaf(K, V, N){}
-	t.root = root
 }
 
 destroy :: proc(t: ^$T/Tree($K, $V, $N)) {

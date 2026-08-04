@@ -129,3 +129,28 @@ pager_close :: proc(pager: ^Pager) {
 	os.close(pager.file)
 	free(pager)
 }
+
+// alloc_page returns a new zero-filled page at the end of the file and
+// advances `num_pages`. Does not flush.
+alloc_page :: proc(
+	p: ^Pager,
+	allocator := context.allocator,
+) -> (
+	page: ^Page,
+	id: Page_ID,
+	ok: bool,
+) {
+	context.allocator = allocator
+
+	id = Page_ID(p.num_pages)
+	page, ok = get_page(p, id)
+	if !ok {
+		return nil, {}, false
+	}
+
+	if u32(id) >= p.num_pages {
+		p.num_pages = u32(id) + 1
+	}
+
+	return page, id, true
+}
