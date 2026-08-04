@@ -125,7 +125,7 @@ remove :: proc(t: ^$T/Tree($K, $V, $N), key: K) -> (ok: bool) {
 		return
 	}
 
-	if small_array.len(&leaf.keys) >= N / 2 {
+	if small_array.len(leaf.keys) >= N / 2 {
 		// NOTE: Decide whether you want to update the key in the parent internal node
 		// in case we just deleted the very first key/value in the leaf node.
 		ok = true
@@ -399,7 +399,7 @@ remove_upward :: proc(t: ^$T/Tree($K, $V, $N), path: []Path_Entry(K, V, N)) {
 
 try_borrow :: proc(parent: ^Internal($K, $V, $N), idx: int) -> bool {
 	child := small_array.get(parent.children, idx)
-	switch child^ {
+	switch _ in child^ {
 	case Leaf(K, V, N):
 		return try_borrow_leaf(parent, idx)
 	case Internal(K, V, N):
